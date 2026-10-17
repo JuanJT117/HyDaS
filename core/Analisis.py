@@ -95,7 +95,7 @@ def crear_grafico_histogramas(df_filtrado, stats_table, station_id=""):
         with plt.style.context('default'):
             fig, axes = plt.subplots(1, 2, figsize=(12, 6), sharey=True)
             
-            # Imputado (Azul Acero)
+            # Imputado
             sns.histplot(df_filtrado['PRECIP_imputado'].dropna(), bins=50, ax=axes[0], kde=False, color='#4682B4', edgecolor='black', linewidth=0.5)
             titulo_imp = f'Precipitación Imputada - {station_id}' if station_id else 'Precipitación Imputada'
             axes[0].set_title(titulo_imp, fontweight='bold', fontsize=12)
@@ -108,7 +108,7 @@ def crear_grafico_histogramas(df_filtrado, stats_table, station_id=""):
             axes[0].text(0.95, 0.95, txt_imp, transform=axes[0].transAxes, va='top', ha='right', 
                          bbox=dict(boxstyle='round', facecolor='white', edgecolor='black', alpha=0.9))
 
-            # Original (Salmón suave)
+            # Original
             sns.histplot(df_filtrado['PRECIP_original'].dropna(), bins=50, ax=axes[1], kde=False, color='#FA8072', edgecolor='black', linewidth=0.5)
             titulo_ori = f'Precipitación Original - {station_id}' if station_id else 'Precipitación Original'
             axes[1].set_title(titulo_ori, fontweight='bold', fontsize=12)

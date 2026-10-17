@@ -1,423 +1,425 @@
+# core/analisis_cuenca.py
+import os
+import sys
+
+# Asegurar carga de librerías nativas (libpng, freetype) en entornos Conda en Windows
+if sys.platform == 'win32':
+    for base_dir in [sys.prefix, sys.exec_prefix]:
+        for sub in [('Library', 'bin'), ('Library', 'usr', 'bin'), ('Library', 'mingw-w64', 'bin'), ('bin',), ('Scripts',)]:
+            p = os.path.join(base_dir, *sub)
+            if os.path.isdir(p):
+                os.environ['PATH'] = p + os.pathsep + os.environ.get('PATH', '')
+                if hasattr(os, 'add_dll_directory'):
+                    try: os.add_dll_directory(p)
+                    except Exception: pass
+
 import pandas as pd
-import traceback
-import io
-import base64
 import numpy as np
 import scipy.stats as stats
-from scipy.stats import gamma, lognorm, norm, genextreme, gumbel_r 
+from scipy.stats import gamma, lognorm, norm, gumbel_r, genextreme
+from scipy.optimize import brentq
+import math
+import io
+import base64
+import traceback
 import matplotlib
-import matplotlib.pyplot as plt
-import math 
-import warnings
-
-# --- OPTIMIZACIÓN 1: Forzar Backend No-Interactivo ---
 matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from typing import Dict, Tuple, List, Optional, Any
 
-# --- Funciones de Ayuda Gráfica ---
+from core.modelos_clima import EntradaDescriptoresChen, ResultadoDescriptoresChen
 
-def _figure_to_base64(fig):
-    """Convierte una figura de Matplotlib a un string base64 optimizado."""
+def _figure_to_base64(fig) -> str:
+    """Convierte una figura Matplotlib a base64 optimizado."""
     buf = io.BytesIO()
-    # DPI 100 es suficiente y más rápido
     fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-    plt.close(fig) 
+    plt.close(fig)
     buf.seek(0)
     return base64.b64encode(buf.getvalue()).decode('utf-8')
 
-# --- Lógica Común Refactorizada ---
-
-def _calculate_regional_params(cociente_lluvia_duracion, log_list):
-    p_r_a = (7353.3606920242*cociente_lluvia_duracion**6) - (12897.462451992*cociente_lluvia_duracion**5) + (8199.0167276778*cociente_lluvia_duracion**4) - (2317.3712794565*cociente_lluvia_duracion**3) + (366.9142815419*cociente_lluvia_duracion**2) + 8.0208384464*cociente_lluvia_duracion + 1.3199316614
-    p_r_b = (-6625.0538375378*cociente_lluvia_duracion**6) + (14651.1423180723*cociente_lluvia_duracion**5) - (12769.031780099*cociente_lluvia_duracion**4) + (5526.6701616568*cociente_lluvia_duracion**3) - (1252.848252752*cociente_lluvia_duracion**2) + 176.629005407*cociente_lluvia_duracion - 12.4169934459
-    p_r_c = (-143.1687369496*cociente_lluvia_duracion**6) + (366.5291775021*cociente_lluvia_duracion**5) - (375.9641589724*cociente_lluvia_duracion**4) + (196.920213889*cociente_lluvia_duracion**3) - (56.4672253684*cociente_lluvia_duracion**2) + 9.7154529619*cociente_lluvia_duracion - 0.2608153057
+class ExtractorCuantilesExtremos:
+    """Motor polimórfico para cálculo de cuantiles p2=0.50, p10=0.90, p25=0.96, p50=0.98 y p100=0.99."""
     
-    log_list.append('PARÁMETRO REGIONAL (a): ' + str(p_r_a))
-    log_list.append('PARÁMETRO REGIONAL (b): ' + str(p_r_b))
-    log_list.append('PARÁMETRO REGIONAL (c): ' + str(p_r_c))
-    
-    return p_r_a, p_r_b, p_r_c
-
-def _calculate_curvas_hidrologicas(p_r_a, p_r_b, p_r_c, p_r_f, AP_60_2, AP_60_10):
-    TR=[2, 5, 10, 20, 50, 100, 500, 1000, 10000, 20000]
-    tr_valores = np.arange(5, 1441, 5) 
-    
-    # --- Curvas de Altura ---
-    df_altura = pd.DataFrame({
-        'TR (AÑOS)': tr_valores,
-        2: np.nan, 5: np.nan, 10: np.nan, 20: np.nan, 50: np.nan,
-        100: np.nan, 500: np.nan, 1000: np.nan, 10000: np.nan
-    })
-
-    df_altura[2] =  (0.35 * math.log(2)  + 0.76) * (((0.54 * (df_altura['TR (AÑOS)'] ** 0.25)) - 0.5) * AP_60_2)
-    df_altura[5] =  (0.35 * math.log(5)  + 0.76) * (((0.54 * (df_altura['TR (AÑOS)'] ** 0.25)) - 0.5) * AP_60_2)
-    df_altura[10] = (0.35 * math.log(10) + 0.76) * (((0.54 * (df_altura['TR (AÑOS)'] ** 0.25)) - 0.5) * AP_60_2)
-    df_altura[20] =  (p_r_a * AP_60_10 * math.log10((10 ** (2-p_r_f)) * TR[3] **(p_r_f - 1)) * df_altura['TR (AÑOS)'])/(60 * ((df_altura['TR (AÑOS)'] + p_r_b)** p_r_c))
-    df_altura[50] =  (p_r_a * AP_60_10 * math.log10((10 ** (2-p_r_f)) * TR[4] **(p_r_f - 1)) * df_altura['TR (AÑOS)'])/(60 * ((df_altura['TR (AÑOS)'] + p_r_b)** p_r_c))
-    df_altura[100] = (p_r_a * AP_60_10 * math.log10((10 ** (2-p_r_f)) * TR[5] **(p_r_f - 1)) * df_altura['TR (AÑOS)'])/(60 * ((df_altura['TR (AÑOS)'] + p_r_b)** p_r_c))
-    df_altura[500] = (p_r_a * AP_60_10 * math.log10((10 ** (2-p_r_f)) * TR[6] **(p_r_f - 1)) * df_altura['TR (AÑOS)'])/(60 * ((df_altura['TR (AÑOS)'] + p_r_b)** p_r_c))
-    df_altura[1000] = (p_r_a * AP_60_10 * math.log10((10 ** (2-p_r_f)) * TR[7] **(p_r_f - 1)) * df_altura['TR (AÑOS)'])/(60 * ((df_altura['TR (AÑOS)'] + p_r_b)** p_r_c))
-    df_altura[10000] = (p_r_a * AP_60_10 * math.log10((10 ** (2-p_r_f)) * TR[8] **(p_r_f - 1)) * df_altura['TR (AÑOS)'])/(60 * ((df_altura['TR (AÑOS)'] + p_r_b)** p_r_c))
-
-    # --- Curvas de Intensidad ---
-    df_intensidad = pd.DataFrame({
-        'TR (AÑOS)': tr_valores,
-        2: np.nan, 5: np.nan, 10: np.nan, 20: np.nan, 50: np.nan,
-        100: np.nan, 500: np.nan, 1000: np.nan, 10000: np.nan
-    })
-    
-    for col in [2, 5, 10, 20, 50, 100, 500, 1000, 10000]:
-        df_intensidad[col] = df_altura[col] * 60 / df_intensidad['TR (AÑOS)']
+    @staticmethod
+    def _calcular_k_kite(Tr: float, skew: float) -> float:
+        """Factor de frecuencia mediante transformación Wilson-Hilferty / Kite."""
+        prob = 1.0 / Tr
+        w = np.sqrt(np.log(1.0 / (prob ** 2)))
+        num = 2.515517 + (0.802853 * w) + (0.010328 * (w ** 2))
+        den = 1.0 + (1.432788 * w) + (0.189269 * (w ** 2)) + (0.001308 * (w ** 3))
+        z = w - (num / den)
         
+        if abs(skew) < 0.001:
+            return float(z)
+        
+        k = skew / 6.0
+        A = (z ** 2) - 1.0
+        B = (1.0 / 3.0) * ((z ** 3) - (6.0 * z))
+        kt = z + (A * k) + (B * (k ** 2)) - (A * (k ** 3)) + (z * (k ** 4)) + ((1.0 / 3.0) * (k ** 5))
+        return float(kt)
+
+    @classmethod
+    def extraer_cuantiles_p24_multi(cls, best_fit_name: str, max_annual_data: np.ndarray) -> Dict[int, float]:
+        """
+        Extrae los cuantiles teóricos fijos P24 para Tr in [2, 10, 25, 50, 100].
+        Retorna diccionario: {2: p2, 10: p10, 25: p25, 50: p50, 100: p100}.
+        """
+        datos = np.asarray(max_annual_data[~np.isnan(max_annual_data)], dtype=np.float64)
+        if len(datos) < 5:
+            raise ValueError(f"Muestra insuficiente ({len(datos)} registros) para inferencia de extremos.")
+
+        nombre_clean = best_fit_name.strip().lower()
+        trs = [2, 10, 25, 50, 100]
+        probs = [1.0 - (1.0 / tr) for tr in trs]
+        cuantiles = {}
+
+        # 1. Log-Pearson III
+        if any(k in nombre_clean for k in ['log pearson', 'log-pearson', 'lp3']):
+            y = np.log10(datos)
+            mean_y, std_y, skew_y = np.mean(y), np.std(y, ddof=1), float(pd.Series(y).skew())
+            for tr in trs:
+                k_val = cls._calcular_k_kite(float(tr), skew_y)
+                cuantiles[tr] = float(10.0 ** (mean_y + (k_val * std_y)))
+
+        # 2. Log-Normal
+        elif any(k in nombre_clean for k in ['log normal', 'log-normal', 'ln']):
+            w = np.log(datos)
+            mean_w, std_w = np.mean(w), np.std(w, ddof=1)
+            for tr, p in zip(trs, probs):
+                z = norm.ppf(p)
+                cuantiles[tr] = float(np.exp(mean_w + z * std_w))
+
+        # 3. Gumbel 2 Poblaciones
+        elif any(k in nombre_clean for k in ['2 poblaciones', '2-poblaciones', 'dos poblaciones']):
+            mid = len(datos) // 2
+            p1 = gumbel_r.fit(datos[:mid])
+            p2 = gumbel_r.fit(datos[mid:])
+            def cdf_mix(x):
+                return 0.5 * gumbel_r.cdf(x, *p1) + 0.5 * gumbel_r.cdf(x, *p2)
+            lim_inf, lim_sup = np.min(datos) * 0.5, np.max(datos) * 5.0
+            for tr, p in zip(trs, probs):
+                cuantiles[tr] = float(brentq(lambda x: cdf_mix(x) - p, lim_inf, lim_sup))
+
+        # 4. Gumbel Simple
+        elif 'gumbel' in nombre_clean:
+            std_x = np.std(datos, ddof=1)
+            alpha = (np.sqrt(6.0) / np.pi) * std_x
+            mu = np.mean(datos) - (0.5772156649 * alpha)
+            for tr, p in zip(trs, probs):
+                cuantiles[tr] = float(mu - alpha * np.log(-np.log(p)))
+
+        # 5. Pearson Tipo III
+        elif 'pearson' in nombre_clean:
+            mean_x, std_x = np.mean(datos), np.std(datos, ddof=1)
+            skew_x = float(pd.Series(datos).skew())
+            if abs(skew_x) < 0.001: skew_x = 0.001
+            beta = (2.0 / skew_x) ** 2
+            alfa = std_x / np.sqrt(beta)
+            gamma_param = mean_x - (alfa * beta)
+            for tr, p in zip(trs, probs):
+                cuantiles[tr] = float(gamma.ppf(p, a=beta, loc=gamma_param, scale=alfa))
+
+        # 6. Exponencial
+        elif 'exp' in nombre_clean:
+            mean_x, std_x = np.mean(datos), np.std(datos, ddof=1)
+            x0 = mean_x - std_x
+            for tr, p in zip(trs, probs):
+                cuantiles[tr] = float(x0 - std_x * np.log(1.0 - p))
+
+        # 7. Normal
+        elif 'normal' in nombre_clean:
+            mean_x, std_x = np.mean(datos), np.std(datos, ddof=1)
+            for tr, p in zip(trs, probs):
+                z = norm.ppf(p)
+                cuantiles[tr] = float(mean_x + z * std_x)
+
+        # 8. Gamma
+        elif 'gamma' in nombre_clean:
+            mean_x, std_x = np.mean(datos), np.std(datos, ddof=1)
+            a_param = (mean_x / std_x) ** 2
+            scale_param = (std_x ** 2) / mean_x
+            for tr, p in zip(trs, probs):
+                cuantiles[tr] = float(gamma.ppf(p, a=a_param, scale=scale_param))
+
+        # 9. GEV
+        elif any(k in nombre_clean for k in ['valores extremos', 'gev']):
+            params = genextreme.fit(datos)
+            for tr, p in zip(trs, probs):
+                cuantiles[tr] = float(genextreme.ppf(p, *params))
+
+        else:
+            raise NotImplementedError(f"Distribución '{best_fit_name}' no soportada por el motor de cuantiles.")
+
+        return cuantiles
+
+def _calculate_regional_params(r: float) -> Tuple[float, float, float]:
+    """Polinomios oficiales de 4º grado (Campos-Aranda, 1990/2010 / SCT)."""
+    r_val = float(np.clip(r, 0.10, 0.699))
+    a = -2.297536 + (100.0389 * r_val) - (432.5438 * (r_val**2)) + (1256.228 * (r_val**3)) - (1028.902 * (r_val**4))
+    b = -9.845761 + (96.94864 * r_val) - (341.4349 * (r_val**2)) + (757.9172 * (r_val**3)) - (598.7461 * (r_val**4))
+    c = -0.06498345 + (5.069294 * r_val) - (16.08111 * (r_val**2)) + (29.0960 * (r_val**3)) - (20.06288 * (r_val**4))
+    return float(a), float(b), float(c)
+
+def _calculate_curvas_hidrologicas(
+    p_r_a: float, p_r_b: float, p_r_c: float, p_r_f: float, p1_10: float
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Construye las matrices de Altura (mm) e Intensidad (mm/h) según Chen (1983).
+    Garantiza índices numéricos en minutos (np.float64) y nombres de columna estándar.
+    """
+    tr_cols = [2, 5, 10, 20, 50, 100, 500, 1000, 10000]
+    duraciones = np.arange(5, 1445, 5, dtype=np.float64)
+    
+    t_grid = duraciones[:, np.newaxis]
+    tr_grid = np.array(tr_cols, dtype=np.float64)[np.newaxis, :]
+    
+    term_frec = np.log10((10.0 ** (2.0 - p_r_f)) * (tr_grid ** (p_r_f - 1.0)))
+    intensidades = (p_r_a * p1_10 * term_frec) / ((t_grid + p_r_b) ** p_r_c)
+    intensidades = np.maximum(intensidades, 0.0)
+    
+    alturas = (intensidades * t_grid) / 60.0
+    
+    df_altura = pd.DataFrame(alturas, index=duraciones, columns=tr_cols)
+    df_altura.index.name = 'DURACION_MIN'
+    
+    df_intensidad = pd.DataFrame(intensidades, index=duraciones, columns=tr_cols)
+    df_intensidad.index.name = 'DURACION_MIN'
+    
     return df_altura, df_intensidad
 
 def _generate_cuenca_plots(df_altura_in, df_intensidad_in, ylim_altura, ylim_intensidad, station_id=""):
-    
-    # --- SANEAMIENTO DE DATOS (FIX KEYERROR) ---
-    # Creamos copias para no afectar los datos globales
+    """Genera los 4 gráficos hidrológicos en base64."""
     df_altura = df_altura_in.copy()
     df_intensidad = df_intensidad_in.copy()
 
-    # Si 'TR (AÑOS)' no está en columnas, reseteamos el índice para sacarlo
-    if 'TR (AÑOS)' not in df_altura.columns:
+    if 'DURACION_MIN' not in df_altura.columns and 'TR (AÑOS)' not in df_altura.columns:
         df_altura.reset_index(inplace=True)
-        # Si al resetear se llama 'index' o 'level_0', lo renombramos por seguridad
-        if 'TR (AÑOS)' not in df_altura.columns and 'index' in df_altura.columns:
-             df_altura.rename(columns={'index': 'TR (AÑOS)'}, inplace=True)
+    col_x_h = 'DURACION_MIN' if 'DURACION_MIN' in df_altura.columns else ('TR (AÑOS)' if 'TR (AÑOS)' in df_altura.columns else df_altura.columns[0])
 
-    if 'TR (AÑOS)' not in df_intensidad.columns:
+    if 'DURACION_MIN' not in df_intensidad.columns and 'TR (AÑOS)' not in df_intensidad.columns:
         df_intensidad.reset_index(inplace=True)
-        if 'TR (AÑOS)' not in df_intensidad.columns and 'index' in df_intensidad.columns:
-             df_intensidad.rename(columns={'index': 'TR (AÑOS)'}, inplace=True)
+    col_x_i = 'DURACION_MIN' if 'DURACION_MIN' in df_intensidad.columns else ('TR (AÑOS)' if 'TR (AÑOS)' in df_intensidad.columns else df_intensidad.columns[0])
 
-    # Validacion final para evitar crash si aun asi falla
-    if 'TR (AÑOS)' not in df_altura.columns:
-        print("ERROR CRÍTICO: No se encontró columna de tiempo 'TR (AÑOS)'")
-        return None, None, None, None
-
-    # --- Configuración de Columnas a Plotear ---
     columnas_precipitacion = [2, 5, 10, 20, 50, 100, 500, 1000, 10000]
     columnas_precipitacion_2 = [100, 500, 1000, 10000]
 
-    # --- Cálculo de límites Y (excluyendo columna de tiempo) ---
-    cols_data = [c for c in df_altura.columns if c != 'TR (AÑOS)']
+    cols_data = [c for c in df_altura.columns if c not in ['TR (AÑOS)', 'DURACION_MIN']]
     max_h_data = df_altura[cols_data].max().max() if cols_data else 100
     
-    cols_data_int = [c for c in df_intensidad.columns if c != 'TR (AÑOS)']
+    cols_data_int = [c for c in df_intensidad.columns if c not in ['TR (AÑOS)', 'DURACION_MIN']]
     max_i_data = df_intensidad[cols_data_int].max().max() if cols_data_int else 100
 
-    if ylim_altura is not None and ylim_altura > 0:
-        final_ylim_h = ylim_altura
-    else:
-        final_ylim_h = max_h_data * 1.1 if max_h_data > 0 else 100
+    final_ylim_h = ylim_altura if (ylim_altura and ylim_altura > 0) else (max_h_data * 1.1 if max_h_data > 0 else 100)
+    final_ylim_i = ylim_intensidad if (ylim_intensidad and ylim_intensidad > 0) else (max_i_data * 1.1 if max_i_data > 0 else 100)
 
-    if ylim_intensidad is not None and ylim_intensidad > 0:
-        final_ylim_i = ylim_intensidad
-    else:
-        final_ylim_i = max_i_data * 1.1 if max_i_data > 0 else 100
-
-    # --- Gráfico Altura 1 ---
+    # 1. Altura Completa
     fig1, ax1 = plt.subplots(figsize=(10, 5))
-    for columna in columnas_precipitacion:
-        if columna in df_altura.columns:
-            ax1.plot(df_altura['TR (AÑOS)'], df_altura[columna], label=f'TR = {columna} años', alpha=0.8)
+    for col in columnas_precipitacion:
+        if col in df_altura.columns:
+            ax1.plot(df_altura[col_x_h], df_altura[col], label=f'TR = {col} años', alpha=0.8)
     ax1.set_xlabel('DURACIÓN (MIN)')
     ax1.set_ylabel('ALTURA (mm)')
-    t_altura = f'CURVAS DE ALTURA - {station_id}' if station_id else 'CURVAS DE ALTURA'
-    ax1.set_title(t_altura)
+    ax1.set_title(f'CURVAS DE ALTURA - {station_id}' if station_id else 'CURVAS DE ALTURA')
     ax1.set_ylim(0, final_ylim_h)
     ax1.legend(loc='upper right', fontsize='small')
     ax1.grid(True, linestyle='--', alpha=0.7)
     plt.tight_layout()
-    plot_1_b64 = _figure_to_base64(fig1)
+    p1 = _figure_to_base64(fig1)
 
-    # --- Gráfico Altura 2 (Zoom) ---
-    df_filtrado_2 = df_altura[(df_altura['TR (AÑOS)'] >= 0) & (df_altura['TR (AÑOS)'] <= 300)]
+    # 2. Altura Zoom 300min
+    df_f2 = df_altura[(df_altura[col_x_h] >= 0) & (df_altura[col_x_h] <= 300)]
     fig2, ax2 = plt.subplots(figsize=(10, 5))
-    for columna in columnas_precipitacion_2:
-        if columna in df_filtrado_2.columns:
-            ax2.plot(df_filtrado_2['TR (AÑOS)'], df_filtrado_2[columna], label=f'TR = {columna} años', alpha=0.8)
+    for col in columnas_precipitacion_2:
+        if col in df_f2.columns:
+            ax2.plot(df_f2[col_x_h], df_f2[col], label=f'TR = {col} años', alpha=0.8)
     ax2.set_xlabel('DURACIÓN (MIN)')
     ax2.set_ylabel('ALTURA (mm)')
-    t_altura2 = f'CURVAS DE ALTURA (0-300min) - {station_id}' if station_id else 'CURVAS DE ALTURA (0-300min)'
-    ax2.set_title(t_altura2)
-    ax2.set_ylim(0, final_ylim_h) 
+    ax2.set_title(f'CURVAS DE ALTURA (0-300min) - {station_id}' if station_id else 'CURVAS DE ALTURA (0-300min)')
+    ax2.set_ylim(0, final_ylim_h)
     ax2.set_xlim(0, 300)
     ax2.legend(loc='upper right', fontsize='small')
     ax2.grid(True, linestyle='--', alpha=0.7)
     plt.tight_layout()
-    plot_2_b64 = _figure_to_base64(fig2)
+    p2 = _figure_to_base64(fig2)
 
-    # --- Gráfico Intensidad 1 ---
+    # 3. Intensidad Completa
     fig3, ax3 = plt.subplots(figsize=(10, 5))
-    for columna in columnas_precipitacion:
-        if columna in df_intensidad.columns:
-            ax3.plot(df_intensidad['TR (AÑOS)'], df_intensidad[columna], label=f'TR = {columna} años', alpha=0.8)
+    for col in columnas_precipitacion:
+        if col in df_intensidad.columns:
+            ax3.plot(df_intensidad[col_x_i], df_intensidad[col], label=f'TR = {col} años', alpha=0.8)
     ax3.set_xlabel('DURACIÓN (MIN)')
     ax3.set_ylabel('INTENSIDAD (mm/hr)')
-    t_int = f'CURVAS DE INTENSIDAD - {station_id}' if station_id else 'CURVAS DE INTENSIDAD'
-    ax3.set_title(t_int)
+    ax3.set_title(f'CURVAS DE INTENSIDAD - {station_id}' if station_id else 'CURVAS DE INTENSIDAD')
     ax3.set_ylim(0, final_ylim_i)
     ax3.legend(loc='upper right', fontsize='small')
     ax3.grid(True, linestyle='--', alpha=0.7)
     plt.tight_layout()
-    plot_3_b64 = _figure_to_base64(fig3)
+    p3 = _figure_to_base64(fig3)
 
-    # --- Gráfico Intensidad 2 (Zoom) ---
-    df_filtrado_3 = df_intensidad[(df_intensidad['TR (AÑOS)'] >= 0) & (df_intensidad['TR (AÑOS)'] <= 300)]
+    # 4. Intensidad Zoom 300min
+    df_f3 = df_intensidad[(df_intensidad[col_x_i] >= 0) & (df_intensidad[col_x_i] <= 300)]
     fig4, ax4 = plt.subplots(figsize=(10, 5))
-    for columna in columnas_precipitacion_2:
-        if columna in df_filtrado_3.columns:
-            ax4.plot(df_filtrado_3['TR (AÑOS)'], df_filtrado_3[columna], label=f'TR = {columna} años', alpha=0.8)
+    for col in columnas_precipitacion_2:
+        if col in df_f3.columns:
+            ax4.plot(df_f3[col_x_i], df_f3[col], label=f'TR = {col} años', alpha=0.8)
     ax4.set_xlabel('DURACIÓN (MIN)')
     ax4.set_ylabel('INTENSIDAD (mm/hr)')
-    t_int2 = f'CURVAS DE INTENSIDAD (0-300min) - {station_id}' if station_id else 'CURVAS DE INTENSIDAD (0-300min)'
-    ax4.set_title(t_int2)
-    ax4.set_ylim(0, final_ylim_i) 
+    ax4.set_title(f'CURVAS DE INTENSIDAD (0-300min) - {station_id}' if station_id else 'CURVAS DE INTENSIDAD (0-300min)')
+    ax4.set_ylim(0, final_ylim_i)
     ax4.set_xlim(0, 300)
     ax4.legend(loc='upper right', fontsize='small')
     ax4.grid(True, linestyle='--', alpha=0.7)
     plt.tight_layout()
-    plot_4_b64 = _figure_to_base64(fig4)
-    
-    return plot_1_b64, plot_2_b64, plot_3_b64, plot_4_b64
+    p4 = _figure_to_base64(fig4)
 
-# --- Lógica Específica de Distribución ---
+    return p1, p2, p3, p4
 
-def _run_log_pearson(df_maximos_mensuales, log_list):
-    log_list.append("### Ejecutando análisis para Log-Pearson III (Dinámico)...")
-    
-    # 1. Transformación Logarítmica
-    df_maximos_mensuales['Ln_Max_Anual'] = np.log(df_maximos_mensuales['Max_Anual'])
-    
-    # 2. Cálculo de Estadísticos de la serie transformada
-    Promedio_Ln_Max_Anual = df_maximos_mensuales['Ln_Max_Anual'].mean()
-    Desviacion_estandar_Ln_Max_Anual = df_maximos_mensuales['Ln_Max_Anual'].std(ddof=1) # Desviación muestral
-    Coeficiente_Asimetria = df_maximos_mensuales['Ln_Max_Anual'].skew() # Asimetría (g)
-    
-    log_list.append(f"Media Ln: {Promedio_Ln_Max_Anual:.4f}")
-    log_list.append(f"Desv. Est. Ln: {Desviacion_estandar_Ln_Max_Anual:.4f}")
-    log_list.append(f"Coef. Asimetría (g): {Coeficiente_Asimetria:.4f}")
-
-    # 3. Función interna para calcular K (Aproximación Kite + Abramowitz-Stegun)
-    def calcular_k_kite(Tr, g):
-        # Paso A: Calcular z (Normal Estándar) usando Abramowitz & Stegun
-        # Probabilidad de excedencia p = 1/Tr
-        # Formula: w = sqrt(ln(1 / p^2))
-        prob = 1.0 / Tr
-        w = np.sqrt(np.log(1.0 / (prob**2)))
-        
-        numerator = 2.515517 + (0.802853 * w) + (0.010328 * (w**2))
-        denominator = 1.0 + (1.432788 * w) + (0.189269 * (w**2)) + (0.001308 * (w**3))
-        
-        z = w - (numerator / denominator)
-        
-        # Paso B: Calcular K ajustado por Asimetría (Ecuación de Kite)
-        if abs(g) < 0.00001: # Si asimetría es 0, K = z (Log-Normal)
-            return z
-        
-        k_val = g / 6.0
-        A = (z**2) - 1.0
-        B = (1.0/3.0) * ((z**3) - (6.0 * z))
-        
-        # Kt = z + A*k + B*k^2 - A*k^3 + z*k^4 + 1/3*k^5
-        Kt = z + (A * k_val) + (B * (k_val**2)) - (A * (k_val**3)) + (z * (k_val**4)) + ((1.0/3.0) * (k_val**5))
-        
-        return Kt
-
-    # 4. Cálculo dinámico de los Factores de Frecuencia (K)
-    KLP3TR2 = calcular_k_kite(2, Coeficiente_Asimetria)
-    KLP3TR10 = calcular_k_kite(10, Coeficiente_Asimetria)
-    KLP3TR100 = calcular_k_kite(100, Coeficiente_Asimetria)
-    
-    log_list.append(f"Factor K (2 años): {KLP3TR2:.4f}")
-    log_list.append(f"Factor K (10 años): {KLP3TR10:.4f}")
-    log_list.append(f"Factor K (100 años): {KLP3TR100:.4f}")
-
-    Cociente_lluvia_duracion = 0.3882
-    
-    # 5. Cálculo de Precipitación para cada TR (X = exp(Media + K*Desv))
-    val_tr100 = np.exp(Promedio_Ln_Max_Anual + (KLP3TR100 * Desviacion_estandar_Ln_Max_Anual))
-    val_tr10 = np.exp(Promedio_Ln_Max_Anual + (KLP3TR10 * Desviacion_estandar_Ln_Max_Anual))
-    val_tr2 = np.exp(Promedio_Ln_Max_Anual + (KLP3TR2 * Desviacion_estandar_Ln_Max_Anual))
-    
-    # 6. Cálculo de parámetros finales
-    p_r_f = val_tr100 / val_tr10
-    AP_60_2 = val_tr2 * Cociente_lluvia_duracion
-    AP_60_10 = AP_60_2 * (0.35 * np.log(10) + 0.76) * (0.54 * (60 ** 0.25) - 0.5)
-
-    log_list.append(f'Relación f calculada: {p_r_f:.4f}')
-    
-    return p_r_f, AP_60_2, AP_60_10, Cociente_lluvia_duracion
-
-def _run_pearson_iii(df_maximos_mensuales, log_list):
-    log_list.append("### Ejecutando análisis para Pearson III...")
-    Promedio_Ln_Max_Anual = df_maximos_mensuales['Max_Anual'].mean()
-    Desviacion_estandar_Ln_Max_Anual = df_maximos_mensuales['Max_Anual'].std()
-    Coeficiente_asimetria_Ln_Max_Anual = df_maximos_mensuales['Max_Anual'].skew()
-    Cociente_lluvia_duracion = 0.3882
-    
-    if abs(Coeficiente_asimetria_Ln_Max_Anual) < 0.001: Coeficiente_asimetria_Ln_Max_Anual = 0.001
-        
-    Beta = (2/Coeficiente_asimetria_Ln_Max_Anual)**2  
-    Alfa = (Desviacion_estandar_Ln_Max_Anual)/((Beta)**0.5)   
-    Gamma = Promedio_Ln_Max_Anual-(Alfa * Beta)   
-
-    p_r_f = ((gamma.ppf(0.99, a=Beta, loc=Gamma, scale=Alfa))) / ((gamma.ppf(0.9, a=Beta, loc=Gamma, scale=Alfa)))
-    AP_60_2 = Cociente_lluvia_duracion * ((gamma.ppf(0.5, a=Beta, loc=Gamma, scale=Alfa)))
-    AP_60_10 = AP_60_2 * (0.35 * np.log(10) + 0.76) * (0.54 * (60 ** 0.25) - 0.5)
-
-    log_list.append(f'Media (X): {Promedio_Ln_Max_Anual:.4f}')
-    log_list.append(f'Relación f: {p_r_f:.4f}')
-    
-    return p_r_f, AP_60_2, AP_60_10, Cociente_lluvia_duracion
-
-def _run_exponencial(df_maximos_mensuales, log_list):
-    log_list.append("### Ejecutando análisis para Exponencial...")
-    Promedio_Max_Anual = df_maximos_mensuales['Max_Anual'].mean()
-    Desviacion_estandar_Max_Anual = df_maximos_mensuales['Max_Anual'].std()
-    Cociente_lluvia_duracion = 0.3882
-    A = Promedio_Max_Anual - Desviacion_estandar_Max_Anual
-    B = Desviacion_estandar_Max_Anual
-    p_r_f = (A - (B * np.log(0.01)))/(A - (B * np.log(0.1)))
-    AP_60_2 = Cociente_lluvia_duracion * (A -(B * np.log(0.5)))
-    AP_60_10 = AP_60_2 * (0.35 * np.log(10) + 0.76) * (0.54 * (60 ** 0.25) - 0.5)
-    log_list.append(f'Media (X): {Promedio_Max_Anual:.4f}')
-    return p_r_f, AP_60_2, AP_60_10, Cociente_lluvia_duracion
-
-def _run_gamma(df_maximos_mensuales, log_list):
-    log_list.append("### Ejecutando análisis para Gamma...")
-    Promedio_Max_Anual = df_maximos_mensuales['Max_Anual'].mean()
-    Desviacion_estandar_Max_Anual = df_maximos_mensuales['Max_Anual'].std()
-    Cociente_lluvia_duracion = 0.3882
-    A = (Desviacion_estandar_Max_Anual**2)/Promedio_Max_Anual
-    B = (Promedio_Max_Anual/Desviacion_estandar_Max_Anual)**2
-    p_r_f = (gamma.ppf(0.99, a=B, scale=A))/(gamma.ppf(0.9, a=B, scale=A))
-    AP_60_2 = Cociente_lluvia_duracion*(gamma.ppf(0.5, a=B, scale=A))
-    AP_60_10 = AP_60_2 * (0.35 * np.log(10) + 0.76) * (0.54 * (60 ** 0.25) - 0.5)
-    log_list.append(f'Media (X): {Promedio_Max_Anual:.4f}')
-    return p_r_f, AP_60_2, AP_60_10, Cociente_lluvia_duracion
-
-def _run_log_normal(df_maximos_mensuales, log_list):
-    log_list.append("### Ejecutando análisis para Log-Normal...")
-    df_maximos_mensuales['Ln_Max_Anual'] = np.log(df_maximos_mensuales['Max_Anual'])
-    Promedio_Max_Anual = df_maximos_mensuales['Ln_Max_Anual'].mean()
-    Desviacion_estandar_Max_Anual = df_maximos_mensuales['Ln_Max_Anual'].std()
-    Cociente_lluvia_duracion = 0.3882
-    p_r_f = lognorm.ppf(0.99, s=Desviacion_estandar_Max_Anual, loc=0, scale=np.exp(Promedio_Max_Anual)) / lognorm.ppf(0.9, s=Desviacion_estandar_Max_Anual, loc=0, scale=np.exp(Promedio_Max_Anual))
-    AP_60_2 = ((lognorm.ppf(0.5, s=Desviacion_estandar_Max_Anual, loc=0, scale=np.exp(Promedio_Max_Anual)))*Cociente_lluvia_duracion)
-    AP_60_10 = AP_60_2 * (0.35 * np.log(10) + 0.76) * (0.54 * (60 ** 0.25) - 0.5)
-    return p_r_f, AP_60_2, AP_60_10, Cociente_lluvia_duracion
-
-def _run_normal(df_maximos_mensuales, log_list):
-    log_list.append("### Ejecutando análisis para Normal...")
-    Promedio_Max_Anual = df_maximos_mensuales['Max_Anual'].mean()
-    Desviacion_estandar_Max_Anual = df_maximos_mensuales['Max_Anual'].std()
-    Cociente_lluvia_duracion = 0.3882
-    p_r_f = norm.ppf(0.99, loc=Promedio_Max_Anual, scale=Desviacion_estandar_Max_Anual) / norm.ppf(0.9, loc=Promedio_Max_Anual, scale=Desviacion_estandar_Max_Anual)
-    AP_60_2 = Cociente_lluvia_duracion * (norm.ppf(0.5, loc=Promedio_Max_Anual, scale=Desviacion_estandar_Max_Anual))
-    AP_60_10 = AP_60_2 * (0.35 * np.log(10) + 0.76) * (0.54 * (60 ** 0.25) - 0.5)
-    return p_r_f, AP_60_2, AP_60_10, Cociente_lluvia_duracion
-
-def _run_gumbel(df_maximos_mensuales, log_list):
-    log_list.append("### Ejecutando análisis para Gumbel...")
-    Count_YE = df_maximos_mensuales['Max_Anual'].size
-    Promedio_Max_Anual = df_maximos_mensuales['Max_Anual'].mean()
-    Desviacion_estandar_Max_Anual = df_maximos_mensuales['Max_Anual'].std()
-    Cociente_lluvia_duracion = 0.3882
-    My = (-1.6483*(10**-12)*(Count_YE**6)) + (6.2811*(10**-10)*(Count_YE**5)) - (9.7156*(10**-8)*(Count_YE**4)) + (7.8564*(10**-6)*(Count_YE**3)) - (3.5782*(10**-4)*(Count_YE**2)) + (9.3362*(10**-3)*Count_YE+0.4308)
-    Sy = (-7.1424*(10**-12)*(Count_YE**6)) + (2.7029*(10**-9)*(Count_YE**5)) - (4.1453*(10**-7)*(Count_YE**4)) + (3.3168*(10**-5)*(Count_YE**3)) - (1.4904*(10**-3)*(Count_YE**2)) + (3.8198*(10**-2)*Count_YE+0.6881)
-    A1 = Sy/Desviacion_estandar_Max_Anual
-    B1 = Promedio_Max_Anual-(My/A1)
-    p_r_f =  (B1-(1/A1*(np.log(np.log(100/99)))))/(B1-(1/A1*(np.log(np.log(10/9)))))
-    AP_60_2 = Cociente_lluvia_duracion*(B1-((1/A1)*(np.log(np.log(2/1)))))
-    AP_60_10 = AP_60_2 * (0.35 * np.log(10) + 0.76) * (0.54 * (60 ** 0.25) - 0.5)
-    return p_r_f, AP_60_2, AP_60_10, Cociente_lluvia_duracion
-
-def _run_gumbel_2_poblaciones(df_maximos_mensuales, log_list):
-    log_list.append("### Ejecutando análisis para Gumbel 2 Poblaciones...")
-    max_annual_data = df_maximos_mensuales['Max_Anual'].dropna()
-    mid = len(max_annual_data) // 2
-    g1 = max_annual_data[:mid]
-    g2 = max_annual_data[mid:]
-    params1 = stats.gumbel_r.fit(g1) 
-    params2 = stats.gumbel_r.fit(g2) 
-    Cociente_lluvia_duracion = 0.3882
-    ppf_99 = 0.5 * stats.gumbel_r.ppf(0.99, *params1) + 0.5 * stats.gumbel_r.ppf(0.99, *params2)
-    ppf_90 = 0.5 * stats.gumbel_r.ppf(0.90, *params1) + 0.5 * stats.gumbel_r.ppf(0.90, *params2)
-    ppf_50 = 0.5 * stats.gumbel_r.ppf(0.50, *params1) + 0.5 * stats.gumbel_r.ppf(0.50, *params2)
-    p_r_f = ppf_99 / ppf_90
-    AP_60_2 = Cociente_lluvia_duracion * ppf_50
-    AP_60_10 = AP_60_2 * (0.35 * np.log(10) + 0.76) * (0.54 * (60 ** 0.25) - 0.5)
-    return p_r_f, AP_60_2, AP_60_10, Cociente_lluvia_duracion
-
-def _run_gev(df_maximos_mensuales, log_list):
-    log_list.append("### Ejecutando análisis para GEV...")
-    max_annual_data = df_maximos_mensuales['Max_Anual'].dropna()
-    Cociente_lluvia_duracion = 0.3882
-    params_gev = stats.genextreme.fit(max_annual_data) 
-    p_r_f = stats.genextreme.ppf(0.99, *params_gev) / stats.genextreme.ppf(0.90, *params_gev)
-    AP_60_2 = Cociente_lluvia_duracion * (stats.genextreme.ppf(0.5, *params_gev))
-    AP_60_10 = AP_60_2 * (0.35 * np.log(10) + 0.76) * (0.54 * (60 ** 0.25) - 0.5)
-    return p_r_f, AP_60_2, AP_60_10, Cociente_lluvia_duracion
-
-# --- Función Principal (Orquestador) ---
-
-def run_cuenca_analysis(best_fit_name, df_maximos_mensuales, ylim_altura=None, ylim_intensidad=None, station_id=""):
-    results = {
-        "log_text": "", "df_altura": pd.DataFrame(), "df_intensidad": pd.DataFrame(),
-        "plot_1_b64": None, "plot_2_b64": None, "plot_3_b64": None, "plot_4_b64": None
-    }
+def run_cuenca_analysis(
+    best_fit_name: str,
+    df_maximos_mensuales: pd.DataFrame,
+    metodo_r: str = "r_regional",
+    r_regional_manual: float = 0.3882,
+    p1_10_manual: Optional[float] = None,
+    p1_25_manual: Optional[float] = None,
+    p1_50_manual: Optional[float] = None,
+    ylim_altura: Optional[float] = None,
+    ylim_intensidad: Optional[float] = None,
+    station_id: str = "",
+    aplicar_weiss: bool = True
+) -> Dict[str, Any]:
+    """
+    Motor matemático de desagregación de tormentas (Chen / Campos-Aranda).
+    Bifurcación exclusiva: 'isoyetas_sct' (Láminas P1) vs 'r_regional' (Factor R Directo).
+    """
     log_list = []
-    
-    try:
-        print(f"Iniciando cálculo para: {best_fit_name}")
-        func_map = {
-            'Log Pearson': _run_log_pearson, 'Pearson III': _run_pearson_iii,
-            'Exponencial': _run_exponencial, 'Gamma': _run_gamma,
-            'Log Normal': _run_log_normal, 'Normal': _run_normal,
-            'Gumbel': _run_gumbel, 'Gumbel 2 Poblaciones': _run_gumbel_2_poblaciones,
-            'General Valores Extremos': _run_gev
-        }
+    advertencias = []
+
+    # 1. Extracción de Máximos Anuales
+    col_target = 'Max_Anual' if 'Max_Anual' in df_maximos_mensuales.columns else df_maximos_mensuales.columns[0]
+    datos_max = df_maximos_mensuales[col_target].dropna().values
+
+    # 2. Extracción de Cuantiles P24 Fijos (Tr = 2, 10, 25, 50, 100)
+    cuantiles_fijos = ExtractorCuantilesExtremos.extraer_cuantiles_p24_multi(best_fit_name, datos_max)
+    p24_fijo_2 = cuantiles_fijos[2]
+    p24_fijo_10 = cuantiles_fijos[10]
+    p24_fijo_25 = cuantiles_fijos[25]
+    p24_fijo_50 = cuantiles_fijos[50]
+    p24_fijo_100 = cuantiles_fijos[100]
+
+    # 3. Factor de Corrección por Intervalo Fijo de Observación (Weiss / OMM)
+    factor_w = 1.13 if aplicar_weiss else 1.0
+    p24_movil_10 = p24_fijo_10 * factor_w
+    p24_movil_25 = p24_fijo_25 * factor_w
+    p24_movil_50 = p24_fijo_50 * factor_w
+    p24_movil_100 = p24_fijo_100 * factor_w
+
+    # 4. Determinación Determinista del Cociente R
+    if metodo_r == "r_regional":
+        log_list.append("Método de Calibración: FACTOR R REGIONAL DIRECTO (Campos-Aranda / SICT)")
+        r_prom_crudo = float(r_regional_manual)
+        r_acotado = float(np.clip(r_prom_crudo, 0.10, 0.699))
         
-        func = func_map.get(best_fit_name)
-        if not func:
-            log_list.append(f"Método {best_fit_name} no reconocido.")
-            results["log_text"] = "\n".join(log_list)
-            return results
-
-        p_r_f, AP_60_2, AP_60_10, Cociente_lluvia_duracion = func(df_maximos_mensuales, log_list)
-        p_r_a, p_r_b, p_r_c = _calculate_regional_params(Cociente_lluvia_duracion, log_list)
-        df_altura, df_intensidad = _calculate_curvas_hidrologicas(p_r_a, p_r_b, p_r_c, p_r_f, AP_60_2, AP_60_10)
+        # Deducción analítica de P1_10 si no se ingresó explícitamente
+        if p1_10_manual and p1_10_manual > 0:
+            p1_10 = float(p1_10_manual)
+        else:
+            p1_10 = r_acotado * p24_movil_10
+            
+        p1_25 = p1_10 * 1.18
+        p1_50 = p1_10 * 1.32
+        r_10 = r_acotado
+        r_25 = r_acotado
+        r_50 = r_acotado
+    else:
+        log_list.append("Método de Calibración: ISOYETAS SCT (Multi-Tr)")
+        p1_10 = float(p1_10_manual) if (p1_10_manual and p1_10_manual > 0) else 40.0
+        p1_25 = float(p1_25_manual) if (p1_25_manual and p1_25_manual > 0) else (p1_10 * 1.18)
+        p1_50 = float(p1_50_manual) if (p1_50_manual and p1_50_manual > 0) else (p1_10 * 1.32)
         
-        plot_1_b64, plot_2_b64, plot_3_b64, plot_4_b64 = _generate_cuenca_plots(df_altura, df_intensidad, ylim_altura, ylim_intensidad, station_id)
+        r_10 = p1_10 / p24_movil_10
+        r_25 = p1_25 / p24_movil_25
+        r_50 = p1_50 / p24_movil_50
+        r_prom_crudo = (r_10 + r_25 + r_50) / 3.0
+        r_acotado = float(np.clip(r_prom_crudo, 0.10, 0.699))
 
-        # --- EXTRACCIÓN DINÁMICA DE PARÁMETROS A DATAFRAME ---
-        lista_parametros = []
-        for linea in log_list:
-            linea_limpia = linea.replace("###", "").replace("`", "").strip()
-            if ":" in linea_limpia:
-                partes = linea_limpia.split(":", 1)
-                lista_parametros.append({"Parámetro": partes[0].strip(), "Valor": partes[1].strip()})
-            elif linea_limpia: # Captura títulos o info extra
-                lista_parametros.append({"Parámetro": "Información", "Valor": linea_limpia})
-        
-        df_parametros = pd.DataFrame(lista_parametros)
+    if r_prom_crudo >= 0.70:
+        advertencias.append(f"R promedio ({r_prom_crudo:.4f}) >= 0.70. Acotado a 0.699 (Límite matemático de Chen).")
+    elif r_prom_crudo < 0.10:
+        advertencias.append(f"R promedio ({r_prom_crudo:.4f}) < 0.10. Acotado a 0.100 mínimo.")
 
-        results = {
-            "log_text": "\n".join(log_list),
-            "df_altura": df_altura,
-            "df_intensidad": df_intensidad,
-            "df_parametros": df_parametros, # Inyectamos el DataFrame al Diccionario de Resultados
-            "plot_1_b64": plot_1_b64,
-            "plot_2_b64": plot_2_b64,
-            "plot_3_b64": plot_3_b64,
-            "plot_4_b64": plot_4_b64
-        }
-        print("Análisis completado.")
-        return results
+    # 5. Cociente de Frecuencia F y Parámetros Chen (a, b, c)
+    f_calc = p24_movil_100 / p24_movil_10
+    param_a, param_b, param_c = _calculate_regional_params(r_acotado)
 
-    except Exception as e:
-        print(f"Error: {e}")
-        traceback.print_exc()
-        results["log_text"] = f"Error: {e}"
-        return results
+    # 6. Generación de Matrices Hidrológicas
+    df_altura, df_intensidad = _calculate_curvas_hidrologicas(param_a, param_b, param_c, f_calc, p1_10)
+
+    # 7. Renderizado de Gráficos en Base64
+    plot_1_b64, plot_2_b64, plot_3_b64, plot_4_b64 = _generate_cuenca_plots(
+        df_altura, df_intensidad, ylim_altura, ylim_intensidad, station_id
+    )
+
+    # 8. Reporte y Esquema Pydantic
+    log_list.append(f"=== REPORTE DE CALIBRACIÓN DE TORMENTAS - ESTACIÓN {station_id} ===")
+    log_list.append(f"Modelo de Distribución Óptimo: {best_fit_name}")
+    log_list.append(f"Factor de Weiss Aplicado: {factor_w:.2f}")
+    log_list.append(f"Láminas 60 min (P1): Tr10={p1_10:.2f} mm | Tr25={p1_25:.2f} mm | Tr50={p1_50:.2f} mm")
+    log_list.append(f"Láminas 24h Móviles: Tr10={p24_movil_10:.2f} mm | Tr100={p24_movil_100:.2f} mm")
+    log_list.append(f"Cocientes de Duración: R10={r_10:.4f} | R25={r_25:.4f} | R50={r_50:.4f}")
+    log_list.append(f"R Aplicado: {r_acotado:.4f} | Factor F: {f_calc:.4f}")
+    log_list.append(f"Parámetros Chen: a={param_a:.4f}, b={param_b:.4f}, c={param_c:.4f}")
+    for adv in advertencias:
+        log_list.append(f"ADVERTENCIA: {adv}")
+
+    resultado_contrato = ResultadoDescriptoresChen(
+        station_id=station_id,
+        distribucion_aplicada=best_fit_name,
+        metodo_r_utilizado=metodo_r,
+        p1_10_mm=p1_10,
+        p1_25_mm=p1_25,
+        p1_50_mm=p1_50,
+        p24_fijo_10_mm=p24_fijo_10,
+        p24_fijo_25_mm=p24_fijo_25,
+        p24_fijo_50_mm=p24_fijo_50,
+        p24_fijo_100_mm=p24_fijo_100,
+        factor_weiss=factor_w,
+        p24_movil_10_mm=p24_movil_10,
+        p24_movil_25_mm=p24_movil_25,
+        p24_movil_50_mm=p24_movil_50,
+        p24_movil_100_mm=p24_movil_100,
+        r_10=r_10,
+        r_25=r_25,
+        r_50=r_50,
+        r_promedio_crudo=r_prom_crudo,
+        r_acotado=r_acotado,
+        f_calculado=f_calc,
+        param_a=param_a,
+        param_b=param_b,
+        param_c=param_c,
+        advertencias=advertencias
+    )
+
+    df_parametros = pd.DataFrame([
+        {"Parámetro": "Método de Calibración", "Valor": "Isoyetas SCT" if metodo_r == "isoyetas_sct" else "Factor R Regional Directo"},
+        {"Parámetro": "Modelo de Distribución", "Valor": best_fit_name},
+        {"Parámetro": "P1_10 (60 min)", "Valor": f"{p1_10:.3f} mm"},
+        {"Parámetro": "Factor Weiss (OMM)", "Valor": f"{factor_w:.2f}"},
+        {"Parámetro": "P24_10 (Móvil)", "Valor": f"{p24_movil_10:.3f} mm"},
+        {"Parámetro": "R Aplicado", "Valor": f"{r_acotado:.4f}"},
+        {"Parámetro": "Factor F (P100/P10)", "Valor": f"{f_calc:.4f}"},
+        {"Parámetro": "Chen a", "Valor": f"{param_a:.4f}"},
+        {"Parámetro": "Chen b", "Valor": f"{param_b:.4f}"},
+        {"Parámetro": "Chen c", "Valor": f"{param_c:.4f}"}
+    ])
+
+    return {
+        "log_text": "\n".join(log_list),
+        "df_altura": df_altura,
+        "df_intensidad": df_intensidad,
+        "df_parametros": df_parametros,
+        "descriptores_chen": resultado_contrato.model_dump(),
+        "plot_1_b64": plot_1_b64,
+        "plot_2_b64": plot_2_b64,
+        "plot_3_b64": plot_3_b64,
+        "plot_4_b64": plot_4_b64
+    }

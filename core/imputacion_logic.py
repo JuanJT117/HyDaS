@@ -517,21 +517,26 @@ def save_imputation_log(log_text, target_id, output_folder):
         print(f"Error al guardar el log QA: {e}")
         return None
 
+def resolver_ruta_hds(ruta_base: str) -> str:
+    """Resuelve la ruta definitiva del archivo .hds GeoPackage/SQLite activo."""
+    if not ruta_base:
+        return ""
+    ruta_str = str(ruta_base)
+    if ruta_str.endswith('.hds') or ruta_str.endswith('.gpkg') or ruta_str.endswith('.sqlite'):
+        return ruta_str
+    if ruta_str.endswith('.tar.xz') or ruta_str.endswith('.xz'):
+        return ruta_str.replace('.tar.xz', '.hds').replace('.xz', '.hds')
+    return ruta_str + ".hds"
+
 def guardar_en_sqlite_hds(df: pd.DataFrame, target_id: str, ruta_base: str) -> bool:
     """
-    Guarda el DataFrame imputado directamente en el GeoPackage (.gpkg / .hds).
+    Guarda el DataFrame imputado directamente en el GeoPackage (.hds / .gpkg).
     Realiza un Upsert (Borra la estación si ya existe y la reescribe) para evitar duplicados.
     """
     if df is None or df.empty or not ruta_base: return False
     
     try:
-        # 1. Derivar la ruta exacta del GeoPackage
-        if ruta_base.endswith('.tar.xz') or ruta_base.endswith('.xz'):
-            ruta_hds = ruta_base.replace('.tar.xz', '.gpkg').replace('.xz', '.gpkg')
-        elif not ruta_base.endswith('.gpkg') and not ruta_base.endswith('.sqlite'):
-            ruta_hds = ruta_base + "_ARF.gpkg"
-        else:
-            ruta_hds = ruta_base
+        ruta_hds = resolver_ruta_hds(ruta_base)
 
         # 2. Preparar el DataFrame
         df_sql = df.copy()
@@ -540,21 +545,85 @@ def guardar_en_sqlite_hds(df: pd.DataFrame, target_id: str, ruta_base: str) -> b
         
         df_sql['clave_estacion'] = str(target_id)
         
-        # 3. Conexión y Upsert (Protegido por WAL para Multihilo)
+        # 3. Conexión y Upsert (Protegido por WAL y busy_timeout)
         import sqlite3
-        conn = sqlite3.connect(ruta_hds)
+        conn = sqlite3.connect(ruta_hds, timeout=10.0)
         conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout = 10000;")
         
-        # Guardamos la estación en su propia tabla para evitar colisiones de esquema (vecinos distintos)
+        # Guardamos la estación en su propia tabla
         nombre_tabla = f"serie_imputada_{target_id}"
         df_sql.to_sql(nombre_tabla, conn, if_exists='replace', index=False)
         
-        conn.commit()
-        conn.close()
         conn.commit()
         conn.close()
         return True
     except Exception as e:
         print(f"⚠️ Error guardando {target_id} en SQLite: {e}")
         import traceback; traceback.print_exc()
+        return False
+
+def guardar_log_en_sqlite_hds(log_text: str, target_id: str, ruta_base: str) -> bool:
+    """Guarda el log de calidad (QA) de una estación en SQLite para persistencia entre sesiones."""
+    if not log_text or not ruta_base: return False
+    try:
+        ruta_hds = resolver_ruta_hds(ruta_base)
+            
+        import sqlite3
+        conn = sqlite3.connect(ruta_hds, timeout=10.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout = 10000;")
+        conn.execute("CREATE TABLE IF NOT EXISTS qa_logs (station_id TEXT PRIMARY KEY, log_text TEXT, fecha TEXT)")
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute("INSERT OR REPLACE INTO qa_logs (station_id, log_text, fecha) VALUES (?, ?, ?)", (str(target_id), log_text, timestamp))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"⚠️ Error guardando log QA de {target_id} en SQLite: {e}")
+        return False
+
+def obtener_log_de_sqlite_hds(target_id: str, ruta_base: str) -> str:
+    """Recupera el log de calidad (QA) de una estación almacenado en SQLite."""
+    if not ruta_base: return ""
+    try:
+        ruta_hds = resolver_ruta_hds(ruta_base)
+            
+        if not os.path.exists(ruta_hds): return ""
+        import sqlite3
+        conn = sqlite3.connect(ruta_hds, timeout=10.0)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='qa_logs'")
+        if not cursor.fetchone():
+            conn.close()
+            return ""
+        cursor.execute("SELECT log_text FROM qa_logs WHERE station_id = ?", (str(target_id),))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else ""
+    except Exception:
+        return ""
+
+def eliminar_estacion_de_sqlite_hds(target_id: str, ruta_base: str) -> bool:
+    """Elimina la tabla de serie imputada y el log QA de una estación en SQLite."""
+    if not target_id or not ruta_base: return False
+    try:
+        ruta_hds = resolver_ruta_hds(ruta_base)
+            
+        if not os.path.exists(ruta_hds): return False
+        import sqlite3
+        conn = sqlite3.connect(ruta_hds, timeout=10.0)
+        conn.execute("PRAGMA busy_timeout = 10000;")
+        conn.execute(f"DROP TABLE IF EXISTS serie_imputada_{target_id}")
+        
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='qa_logs'")
+        if cursor.fetchone():
+            conn.execute("DELETE FROM qa_logs WHERE station_id = ?", (str(target_id),))
+            
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"⚠️ Error eliminando {target_id} de SQLite: {e}")
         return False

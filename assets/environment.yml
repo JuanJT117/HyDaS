@@ -1,14 +1,16 @@
-name: hydas_env
+name: flet_env
 channels:
   - conda-forge
   - defaults
 dependencies:
   - python>=3.10
-  - flet==0.28.3
+  - pip
   - richdem
   - rasterio
   - geopandas
   - scikit-image
+  - scikit-learn
+  - matplotlib
   - networkx
   - shapely
   - fiona
@@ -16,7 +18,11 @@ dependencies:
   - numpy
   - scipy
   - cupy
+  - requests
+  - jinja2
+  - folium
   - pip:
+      - flet==0.28.3
       - pydantic
       - sqlalchemy
       - geoalchemy2
@@ -28,9 +34,12 @@ dependencies:
       - fpdf2
       - geopy
       - pmdarima
+      - pykrige
       - tabulate
       - statsmodels
       - pyarrow
       - psutil
       - gputil
       - tqdm
+      - urllib3
+

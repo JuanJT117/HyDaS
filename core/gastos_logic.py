@@ -10,6 +10,7 @@ import concurrent.futures
 from scipy import interpolate
 from core import hidrologia_mx
 import threading
+import copy
 
 import os
 from datetime import datetime, timedelta
@@ -331,11 +332,74 @@ def _run_hms_isolated(area, tc, n_pond,
 # 3. LÓGICA PRINCIPAL (CÁLCULO)
 # ==========================================
 
+# =========================================================================
+# 1. BYPASS DE LLUVIA PARA IMPORTACIÓN DE ESCENARIO REGIONAL (ARF)
+# =========================================================================
+def calcular_lluvias_escenario(page=None, modo_lluvia=None, session_dict=None):
+    """
+    [Directriz Zero-Trust & EAFP] Intercepta el motor de lluvia de Gastos.
+    Si el modo activo es regional_arf, extrae los datos Read-Only del Módulo 4,
+    hace una copia profunda y los asigna al escenario activo sin State Clobbering.
+    Soporta tanto page.session como session_dict puro para pruebas y CLI.
+    """
+    try:
+        session = session_dict
+        if session is None and page is not None and hasattr(page, "session"):
+            session = page.session
+            
+        if session is None:
+            raise ValueError("Se requiere session_dict o page.session para calcular_lluvias_escenario.")
+
+        # Adaptador flexible para get y set
+        def _get(k, default=None):
+            if hasattr(session, "get"):
+                return session.get(k, default)
+            elif isinstance(session, dict):
+                return session.get(k, default)
+            return default
+
+        def _set(k, v):
+            if hasattr(session, "set"):
+                session.set(k, v)
+            elif isinstance(session, dict):
+                session[k] = v
+
+        if modo_lluvia is None:
+            modo_lluvia = _get("modo_lluvia_activo")
+        
+        if modo_lluvia == "regional_arf":
+            print("|> [MOTOR GASTOS] Bypass Regional activado. Extrayendo datos del Módulo 4...")
+            
+            # 1. Lectura Defensiva de la Fuente de Verdad Global (Solo Lectura)
+            df_i_arf = _get("arf_df_intensidad_maestra")
+            df_h_arf = _get("arf_df_altura_maestra")
+            df_hiet_arf = _get("arf_df_hietograma_maestro")
+            
+            if df_i_arf is None or df_h_arf is None:
+                raise ValueError("No se encontraron matrices ARF globales. Asegúrese de haber calculado y exportado el Módulo 4.")
+            
+            # 2. Copia Profunda para Aislar el Escenario (Evitar State Clobbering)
+            _set("df_intensidad", copy.deepcopy(df_i_arf))
+            _set("df_altura", copy.deepcopy(df_h_arf))
+            
+            if df_hiet_arf is not None:
+                _set("df_hms", copy.deepcopy(df_hiet_arf))
+                
+            print("|> [MOTOR GASTOS] Matrices ARF inyectadas en el Escenario Local con éxito.")
+            return True, "Lluvia Regional (ARF) importada al escenario correctamente."
+
+        return False, "Continuando con lógica clásica (Simple/Thiessen)."
+    except Exception as e:
+        print(f"❌ Error en calcular_lluvias_escenario: {e}")
+        raise e
+
 def calcular_coeficientes_y_gastos(
     df_configurado, df_cotas, metodo_tc="Kirpich", modo_distribuido=False, 
     estaciones_db=None, pesos_estaciones=None, df_int_global=None, df_alt_global=None,
     fcc=1.0, lambda_ia=0.2, condicion_amc="II", flujo_base=0.0,
-    lista_tr=None, tipo_tormenta="bloques", tipo_cinematica="dinamico" # <--- RECIBIMOS LA LISTA DINÁMICA DE LA UI
+    lista_tr=None, tipo_tormenta="bloques", tipo_cinematica="dinamico",
+    aplicar_temez: bool = False, # <--- NUEVO INTERRUPTOR DE DOMINIO
+    aplicar_arf: bool = False, df_intensidad_arf=None, df_altura_arf=None, page=None
 ):
     log = []
     res_hidrogramas = {}
@@ -351,7 +415,7 @@ def calcular_coeficientes_y_gastos(
         def _sanitizar_lluvias(df_in):
             """
             Hidrata DataFrames desde el disco duro (Parquet) bajo demanda (JIT) para ahorrar RAM,
-            y convierte el tiempo ('TR (AÑOS)') en el índice matemático estricto.
+            y convierte el tiempo ('DURACION_MIN' o 'TR (AÑOS)') en el índice matemático estricto.
             """
             if df_in is None: return None
             
@@ -367,24 +431,59 @@ def calcular_coeficientes_y_gastos(
                 df_out = df_in.copy() # Flujo Legacy si ya era DataFrame
             
             # 1. Blindaje de Columna de Tiempo
-            if 'TR (AÑOS)' in df_out.columns:
+            if 'DURACION_MIN' in df_out.columns:
+                df_out.set_index('DURACION_MIN', inplace=True)
+            elif 'TR (AÑOS)' in df_out.columns:
                 df_out.set_index('TR (AÑOS)', inplace=True)
             elif 'index' in df_out.columns: 
                 df_out.set_index('index', inplace=True)
                 
-            # 2. Blindaje de Tipos (Interpolación requiere flotantes)
+            # 2. Blindaje de Tipos (Interpolación requiere flotantes np.float64)
             try:
-                df_out.index = df_out.index.astype(float)
+                df_out.index = df_out.index.astype(np.float64)
             except Exception as e:
-                log.append(f"Aviso Sanitizador: Falla al convertir índice a flotante. {e}")
+                log.append(f"Aviso Sanitizador: Fallo conversión de índice a float: {e}")
                 
             # 3. Uniformidad EAFP: Todas las columnas de TR serán cadenas para evitar KeyError en búsquedas
             df_out.columns = [str(c) for c in df_out.columns]
             return df_out
 
-        # Sanitizamos los datos globales por defecto para el Modo Simple
-        df_int_global = _sanitizar_lluvias(df_int_global)
-        df_alt_global = _sanitizar_lluvias(df_alt_global)
+        # =========================================================================
+        # 1. BYPASS REGIONAL ARF (ADAPTER PATTERN & ZERO-TRUST)
+        # =========================================================================
+        modo_activo = page.session.get("modo_lluvia_activo") if page and hasattr(page, "session") else None
+        es_modo_arf = bool(aplicar_arf or modo_activo == "regional_arf")
+        if es_modo_arf:
+            print(f"|> [MOTOR GASTOS] Iniciando cálculos. Modo ARF activo.")
+            
+            if page is not None and hasattr(page, "session"):
+                exito, msg = calcular_lluvias_escenario(page, "regional_arf")
+                print(f"|> [BYPASS ESCENARIO] {msg}")
+                df_int_global = page.session.get("df_intensidad")
+                df_alt_global = page.session.get("df_altura")
+            elif df_intensidad_arf is not None and df_altura_arf is not None:
+                df_int_global = copy.deepcopy(df_intensidad_arf)
+                df_alt_global = copy.deepcopy(df_altura_arf)
+            elif df_int_global is not None and df_alt_global is not None:
+                df_int_global = copy.deepcopy(df_int_global)
+                df_alt_global = copy.deepcopy(df_alt_global)
+            else:
+                raise ValueError("Se requiere el contexto de la página (page) o matrices válidas para extraer variables ARF.")
+                
+            if df_int_global is None or df_alt_global is None or (hasattr(df_int_global, "empty") and df_int_global.empty):
+                raise ValueError("Contrato de Datos Roto: Matrices ARF ausentes. Ejecute el Módulo 4 primero.")
+                
+            print("|> [NÚCLEO FÍSICO] Omitiendo generación IDF local. Adoptando matrices de lluvia regionales aisladas (ARF).")
+            df_int_global = _sanitizar_lluvias(df_int_global)
+            df_alt_global = _sanitizar_lluvias(df_alt_global)
+        else:
+            # =========================================================================
+            # LÓGICA CLÁSICA: Generación de curvas locales
+            # =========================================================================
+            print("|> [NÚCLEO FÍSICO] Ejecutando generación de lluvias clásica (Puntual/Thiessen).")
+            # Sanitizamos los datos globales por defecto para el Modo Simple
+            df_int_global = _sanitizar_lluvias(df_int_global)
+            df_alt_global = _sanitizar_lluvias(df_alt_global)
 
         # 1. Coeficientes Ponderados (Usando Tablas Externas)
         # 1. Coeficientes Ponderados (Usando Interceptores Seguros)
@@ -526,7 +625,7 @@ def calcular_coeficientes_y_gastos(
                                     tc_eval = max(min(tc, tiempos.max()), tiempos.min())
                                     I_exacta = np.exp(f_int_log(np.log(tc_eval))) * fcc
                                     
-                                    if area > 1.0: # Reducción Areal de Témez
+                                    if aplicar_temez and not es_modo_arf and area > 1.0: # Reducción Areal de Témez
                                         factor_areal = max(1.0 - (np.log10(area) / 15.0), 0.5)
                                         I_exacta *= factor_areal
                                         
@@ -670,16 +769,21 @@ def calcular_coeficientes_y_gastos(
                             # --- CORRECCIÓN FCC: Aplicamos Factor de Cambio Climático a la lluvia racional ---
                             I_exacta = I_exacta * fcc
                             
-                            # --- CORRECCIÓN TÉMEZ: Factor de Reducción Areal (ARF) ---
-                            # Evita la sobreestimación masiva asumiendo que la tormenta no cubre toda el área
-                            if area > 1.0:
-                                # Fórmula de Témez (K_A = 1 - log10(A)/15)
-                                factor_areal = 1.0 - (np.log10(area) / 15.0)
-                                factor_areal = max(factor_areal, 0.5) # Abroche de seguridad térmica (clamp)
-                                I_exacta = I_exacta * factor_areal
-                                
-                                if area > 3.0:
-                                    log.append(f"⚠️ AVISO QA: Cuenca '{cid}' (Área = {area:.2f} km²). Método Racional Penalizado (Factor Areal: {factor_areal:.2f}). No recomendable para cuencas tan grandes.")
+                            # === EVALUACIÓN DEL FACTOR DE REDUCCIÓN AREAL (TÉMEZ) ===
+                            # Regla: Solo aplica si el usuario lo activó explícitamente Y el modelo NO viene reducido por ARF
+                            if aplicar_temez and not es_modo_arf and area > 1.0:
+                                factor_areal = max(1.0 - (np.log10(area) / 15.0), 0.5)
+                                if str(tr) == str(tr_cols[0]):
+                                    log.append(f"Cuenca {cid}: Reducción Témez activa (Área = {area:.2f} km², KA = {factor_areal:.3f})")
+                            else:
+                                factor_areal = 1.0
+                                if str(tr) == str(tr_cols[0]):
+                                    if es_modo_arf:
+                                        log.append(f"Cuenca {cid}: Reducción Témez omitida (Lluvia ya reducida por Módulo ARF).")
+                                    elif not aplicar_temez:
+                                        log.append(f"Cuenca {cid}: Reducción Témez desactivada por usuario (Gasto pleno).")
+
+                            I_exacta = I_exacta * factor_areal
 
                             # 4. Cálculo de Caudal (Ecuación Universal: Q = 0.278 * C * I * A)
                             C = row[f"C_pond_TR{tr}"] 

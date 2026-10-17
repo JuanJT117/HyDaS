@@ -1,5 +1,8 @@
 # HyDaS - Documentación Técnica y Guía de Despliegue
 
+> 🧭 **Centro de Control del Proyecto:**  
+> Toda la arquitectura, especificaciones técnicas, protocolos de seguridad, suite de pruebas automatizadas (21 tests) y mapa esquemático de procesos se encuentran centralizados en el **[Centro de Control](file:///c:/Users/USER/Documents/proyectos/conda/CONAGUA-Completando_Datos/Version11.2/centro_de_control/INDICE_DOCUMENTACION.md)** (`centro_de_control/`).
+
 ## Resumen de Módulos
 
 El proyecto está estructurado mediante arquitectura limpia (Separación de Preocupaciones) dividiendo el código en los siguientes módulos principales:

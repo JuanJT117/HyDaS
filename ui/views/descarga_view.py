@@ -40,69 +40,177 @@ def build_descarga_view(page: ft.Page):
     
     progreso_espacial = ft.ProgressRing(visible=False, color="#00ff41", width=20, height=20)
 
-    def procesar_shapefile_tarea(ruta_shp_original):
+    # =========================================================================
+    # MECANISMO DE TEAR-DOWN: PURGA DE ESTADO Y MEMORIA (DIRECTRIZ 1 y 4)
+    # =========================================================================
+    
+    def ejecutar_purga():
         try:
-            # 1. NO COPIAR EL SHP. Leer directamente de la ruta original.
-            # Esto garantiza que Geopandas lea los archivos .prj y .shx hermanos.
-            resultado = MotorEspacial.procesar_cuenca_objetivo(ruta_shp_original, buffer_km=100)
+            page.close(dlg_confirmacion_purga)
             
-            df_cat = page.session.get("indice_bd_local")
-            claves = []
+            # 1. Aislamiento y Destrucción de Variables en RAM
+            keys_to_remove = [
+                "cuenca_geojson", "gdf_multicuenca", "area_cuenca_km2", 
+                "wkt_envolvente_busqueda", "es_multicuenca_arf",
+                "buffer_geojson", "cuenca_bbox", "arf_activado",
+                "buffer_geom", "buffer_geom_shapely", "cuenca_activa_ruta",
+                "claves_objetivo", "total_estaciones_extraidas"
+            ]
+            for key in keys_to_remove:
+                if page.session.contains_key(key):
+                    page.session.remove(key)
             
-            if df_cat is not None and not df_cat.empty:
-                claves = GestorExtraccion.filtrar_estaciones_por_buffer(resultado["buffer_geom"], df_cat)
+            # 2. Restauración de UI al estado por defecto
+            modo_actual.value = "POR ESTADO"
+            modo_actual.color = "#00ff41"
+            lbl_area.value = "Área: N/A"
+            lbl_estaciones.value = "Estaciones en Rango: 0"
+            lbl_arf_status.value = "Módulo ARF: INACTIVO"
+            lbl_arf_status.color = "grey"
+            elementos_seleccionados.clear()
             
-            # 2. Inyección en sesión
-            page.session.set("cuenca_activa_ruta", ruta_shp_original)
-            page.session.set("claves_objetivo", claves)
-            page.session.set("arf_activado", resultado["arf_activado"])
-            page.session.set("area_cuenca_km2", resultado["area_km2"])
-            page.session.set("cuenca_geojson", resultado["cuenca_geojson"])
-            page.session.set("buffer_geojson", resultado["buffer_geojson"])
-            page.session.set("cuenca_bbox", resultado["bbox"]) 
-            page.session.set("total_estaciones_extraidas", len(claves))
+            # Limpiamos terminal e informamos
+            terminal_list.controls.clear()
+            terminal_list.controls.append(ft.Text("> [SISTEMA] Geometría purgada. Sistema listo para nueva ingesta.", color="#00ff41"))
             
-            # 3. Actualizar Textos de la UI
-            lbl_area.value = f"Área: {resultado['area_km2']} km²"
-            lbl_estaciones.value = f"Estaciones en Rango: {len(claves)}"
-            if resultado["arf_activado"]:
-                lbl_arf_status.value = "Módulo 4 (ARF): HABILITADO"
-                lbl_arf_status.color = "#00ff41"
-            else:
-                lbl_arf_status.value = "Módulo 4 (ARF): NO REQUIERE"
-                lbl_arf_status.color = "orange"
-                
-            page.snack_bar = ft.SnackBar(ft.Text(f"Éxito: {len(claves)} estaciones encontradas."), bgcolor="#00ff41")
-            
-            # 4. REDIBUJAR MAPA AUTOMÁTICAMENTE (¡Esto faltaba!)
-            # Cambiamos el modo directamente y ejecutamos las funciones de zoom y render
-            # El zoom ya está auto-incluido en dibujar_mapa() cuando el modo es CUENCA OBJETIVO
-            
-            def _refresh_map():
-                modo_actual.value = "CUENCA OBJETIVO"
+            # Limpiamos o redibujamos el contenedor del mapa
+            try:
                 dibujar_mapa()
-                page.update()
-                
-            page.run_thread(_refresh_map)
+            except Exception:
+                try:
+                    contenedor_mapa.content = ft.Container(
+                        content=ft.Text("SIN GEOMETRÍA CARGADA", color="#333333", size=20, weight="bold"),
+                        alignment=ft.alignment.center,
+                        expand=True
+                    )
+                except Exception:
+                    pass
             
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            page.snack_bar = ft.SnackBar(ft.Text(f"Error Espacial: {str(e)}"), bgcolor="#cc0000")
-        finally:
-            progreso_espacial.visible = False
-            page.snack_bar.open = True
             page.update()
+            
+            # 3. Recolección de Basura Explícita (Gestión Big Data)
+            import gc
+            gc.collect()
+            print("|> [MOTOR ESPACIAL] Purga ejecutada. RAM liberada.")
+            
+        except Exception as ex:
+            import traceback
+            traceback.print_exc()
+            page.open(
+                ft.SnackBar(content=ft.Text(f"ERROR al purgar memoria: {ex}", color="#ffffff"), bgcolor="#cc0000")
+            )
+
+    # Diálogo modal Flet 0.28+
+    dlg_confirmacion_purga = ft.AlertDialog(
+        modal=True,
+        title=ft.Row([ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, color="#cc0000"), ft.Text("ADVERTENCIA CRÍTICA")]),
+        content=ft.Text("¿Desea purgar la geometría actual y reiniciar el módulo?\nSe perderán los polígonos en la memoria RAM."),
+        actions=[
+            ft.TextButton("Cancelar", on_click=lambda e: page.close(dlg_confirmacion_purga)),
+            ft.TextButton("Purgar Entradas", on_click=lambda e: ejecutar_purga(), style=ft.ButtonStyle(color="#cc0000")),
+        ],
+        actions_alignment=ft.MainAxisAlignment.END,
+    )
+
+    def confirmar_purga(e):
+        page.open(dlg_confirmacion_purga)
+        
+    btn_purgar = ft.IconButton(
+        icon=ft.Icons.DELETE_SWEEP, 
+        icon_color="#cc0000", 
+        tooltip="Purgar Geometría y Reiniciar", 
+        on_click=confirmar_purga
+    )
 
     def on_shp_selected(e: ft.FilePickerResultEvent):
         if e.files:
             progreso_espacial.visible = True
             page.update()
             ruta_shp = e.files[0].path
-            # IMPORTANTE: Ejecutar en background para no congelar la UI
-            page.run_thread(procesar_shapefile_tarea, ruta_shp)
+            
+            def _on_success():
+                try:
+                    df_cat = page.session.get("indice_bd_local")
+                    claves = []
+                    
+                    buffer_geom = page.session.get("buffer_geom_shapely")
+                    wkt_env = page.session.get("wkt_envolvente_busqueda")
+                    if df_cat is not None and not df_cat.empty and (buffer_geom or wkt_env):
+                        claves = GestorExtraccion.filtrar_estaciones_por_buffer(buffer_geom, df_cat, wkt_envolvente=wkt_env, buffer_km=100.0)
+                    
+                    page.session.set("cuenca_activa_ruta", ruta_shp)
+                    page.session.set("claves_objetivo", claves)
+                    page.session.set("total_estaciones_extraidas", len(claves))
+                    
+                    area_km2 = page.session.get("area_cuenca_km2")
+                    gdf_multi = page.session.get("gdf_multicuenca")
+                    num_cuencas = len(gdf_multi) if gdf_multi is not None else 1
+                    
+                    lbl_area.value = f"Área: {area_km2} km² ({num_cuencas} cuencas)"
+                    lbl_estaciones.value = f"Estaciones en Rango: {len(claves)}"
+                    
+                    # 2. Evaluación Topológica: Disparador del Modo ARF (PARTE 2)
+                    if area_km2 > 25.0:
+                        page.session.set("es_multicuenca_arf", True)
+                        page.session.set("arf_activado", True)
+                        lbl_arf_status.value = "Módulo 4 (ARF): HABILITADO (Multicuenca)"
+                        lbl_arf_status.color = "#00ff41"
+                        
+                        # Alerta UI Flet 0.28+ (Acento Hacker/Cyberpunk)
+                        page.open(
+                            ft.SnackBar(
+                                content=ft.Row([
+                                    ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, color="#00ff41"),
+                                    ft.Text(
+                                        f"ESCALA REGIONAL DETECTADA: {num_cuencas} cuenca(s) con {area_km2:.2f} km². "
+                                        f"Modo ARF Multicuenca activado automáticamente.",
+                                        color="#ffffff", weight="bold"
+                                    )
+                                ]),
+                                bgcolor="#111111", duration=6000
+                            )
+                        )
+                    else:
+                        page.session.set("es_multicuenca_arf", False)
+                        page.session.set("arf_activado", False)
+                        lbl_arf_status.value = "Módulo 4 (ARF): NO REQUIERE"
+                        lbl_arf_status.color = "orange"
+                        
+                        page.open(
+                            ft.SnackBar(
+                                content=ft.Text(f"Éxito: {num_cuencas} cuenca(s) con {area_km2:.2f} km². Escala local (No requiere ARF).", color="#ffffff"),
+                                bgcolor="#00ff41", duration=4000
+                            )
+                        )
+                    
+                    modo_actual.value = "CUENCA OBJETIVO"
+                    dibujar_mapa()
+                    
+                except Exception as ex:
+                    import traceback; traceback.print_exc()
+                    page.open(ft.SnackBar(content=ft.Text(f"Error UI: {str(ex)}", color="#ffffff"), bgcolor="#cc0000"))
+                finally:
+                    progreso_espacial.visible = False
+                    page.update()
 
-    shp_picker = ft.FilePicker(on_result=on_shp_selected)
-    page.overlay.append(shp_picker)
+            def _on_error():
+                progreso_espacial.visible = False
+                page.update()
+
+            # Disparar la tarea asíncrona del núcleo espacial mitigando el bloqueo del GIL
+            MotorEspacial.calcular_area_cuenca_async(ruta_shp, epsg_utm=32614, page=page, buffer_km=100, on_success=_on_success, on_error=_on_error)
+
+    def _get_or_create_picker(key, on_result):
+        p = page.session.get(key)
+        if not p:
+            p = ft.FilePicker(on_result=on_result)
+            page.session.set(key, p)
+            page.overlay.append(p)
+        else:
+            p.on_result = on_result
+        return p
+
+    shp_picker = _get_or_create_picker("descarga_shp_picker", on_shp_selected)
 
     btn_cuenca_objetivo = ft.OutlinedButton(
         "CUENCA OBJETIVO (SHP)",
@@ -179,10 +287,9 @@ def build_descarga_view(page: ft.Page):
     def on_guardar_bd_masiva(e: ft.FilePickerResultEvent):
         if e.path: run_extraction_thread(ruta_target=e.path)
 
-    picker_vincular_bd = ft.FilePicker(on_result=on_vincular_bd_result)
-    picker_exportar_csv = ft.FilePicker(on_result=on_exportar_csv_result)
-    picker_guardar_bd = ft.FilePicker(on_result=on_guardar_bd_masiva)
-    page.overlay.extend([picker_vincular_bd, picker_exportar_csv, picker_guardar_bd])
+    picker_vincular_bd = _get_or_create_picker("descarga_picker_vincular_bd", on_vincular_bd_result)
+    picker_exportar_csv = _get_or_create_picker("descarga_picker_exportar_csv", on_exportar_csv_result)
+    picker_guardar_bd = _get_or_create_picker("descarga_picker_guardar_bd", on_guardar_bd_masiva)
 
     # --- 3. BOTONES DE CONTROL ---
     btn_modo_estado = ft.TextButton("🗺️ POR ESTADO", on_click=lambda e: cambiar_modo(e, "POR ESTADO"), style=ft.ButtonStyle(color="#00ff41"))
@@ -196,25 +303,22 @@ def build_descarga_view(page: ft.Page):
         if not ruta_bd:
             log_terminal("> [ERROR] Vincula una BD (.tar.xz) primero.")
             return
-        # (El resto de la lógica de auditoría se mantiene igual...)
         bloquear_interfaz(True)
         progreso_bar.visible = True; progreso_bar.value = 0
         btn_detener.visible, btn_iniciar.visible = True, False
         def task():
             try:
-                # Recibimos el diccionario de estadísticas del Core
                 exito, msj, stats_audit = descarga_logic.auditar_base_datos_profunda(ruta_bd, ruta_salida, log_terminal, update_progreso)
                 
                 def final():
                     bloquear_interfaz(False)
                     btn_detener.visible, btn_iniciar.visible = False, True
                     
-                    # --- CONEXIÓN DE ESTADO AL MAPA ---
                     if exito and stats_audit:
                         estados_auditados.clear()
                         for k, v in stats_audit.items():
                             estados_auditados[k] = v["sanas"] > 0
-                        dibujar_mapa() # Redibujamos el mapa para que pinte la auditoría real
+                        dibujar_mapa()
                     
                     page.snack_bar = ft.SnackBar(ft.Text(msj, weight="bold", color="black"), bgcolor="#00ff41" if exito else "red", open=True)
                     log_terminal(f"> {msj}")
@@ -229,8 +333,7 @@ def build_descarga_view(page: ft.Page):
             elementos_seleccionados.clear(); dibujar_mapa()
             procesar_auditoria_hilo(e.path)
 
-    picker_auditoria = ft.FilePicker(on_result=on_audit_dir_result)
-    page.overlay.append(picker_auditoria)
+    picker_auditoria = _get_or_create_picker("descarga_picker_auditoria", on_audit_dir_result)
 
     btn_auditar = ft.TextButton("✅ AUDITAR BD LOCAL", on_click=lambda _: picker_auditoria.get_directory_path(dialog_title="Guardar Informe"), style=ft.ButtonStyle(color="#ff9900"))
     btn_vincular_bd = ft.OutlinedButton("VINCULAR BD (.xz)", icon=ft.Icons.LINK, on_click=lambda _: picker_vincular_bd.pick_files(allowed_extensions=["xz"]), style=ft.ButtonStyle(color="white"))
@@ -575,13 +678,15 @@ def build_descarga_view(page: ft.Page):
         # Si es Cuenca Objetivo, usamos la lista de estaciones previamente calculadas en memoria
         if modo_actual.value == "CUENCA OBJETIVO":
             claves_obj = page.session.get("claves_objetivo")
-            buffer_geom = page.session.get("buffer_geom")
+            buffer_geom = page.session.get("buffer_geom") or page.session.get("buffer_geom_shapely")
             df_cat = page.session.get("indice_bd_local")
             
             # --- CORRECCIÓN CRÍTICA: Auto-recálculo si la BD se vinculó DESPUÉS de subir el SHP ---
-            if (not claves_obj or len(claves_obj) == 0) and buffer_geom is not None and df_cat is not None:
+            if (not claves_obj or len(claves_obj) == 0) and (buffer_geom is not None or page.session.get("wkt_envolvente_busqueda")) and df_cat is not None:
                 log_terminal("> [SISTEMA] Sincronizando cruce espacial (BD vinculada posterior al SHP)...")
-                claves_obj = descarga_logic.GestorExtraccion.filtrar_estaciones_por_buffer(buffer_geom, df_cat)
+                claves_obj = descarga_logic.GestorExtraccion.filtrar_estaciones_por_buffer(
+                    buffer_geom, df_cat, wkt_envolvente=page.session.get("wkt_envolvente_busqueda"), buffer_km=100.0
+                )
                 page.session.set("claves_objetivo", claves_obj)
                 
             if not claves_obj:
@@ -671,7 +776,7 @@ def build_descarga_view(page: ft.Page):
                         content=ft.Column([
                             ft.Row([
                                 ft.Row([ft.Text("MAPA GEOESPACIAL: ", color="white", weight="bold"), modo_actual]),
-                                ft.Row([btn_inspeccionar, btn_iniciar, btn_detener, btn_puente])
+                                ft.Row([btn_purgar, btn_inspeccionar, btn_iniciar, btn_detener, btn_puente])
                             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                             ft.Stack([
                                 contenedor_mapa

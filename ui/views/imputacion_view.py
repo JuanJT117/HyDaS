@@ -54,7 +54,21 @@ def build_imputacion_view(page: ft.Page):
         ], alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
         bgcolor=add_opacity("#050505", 0.95), expand=True, alignment=ft.alignment.center, visible=False
     )
+    for c in list(page.overlay):
+        if getattr(c, "_is_imput_bloqueo", False):
+            page.overlay.remove(c)
+    bloqueo_radiactivo._is_imput_bloqueo = True
     page.overlay.append(bloqueo_radiactivo)
+
+    def _get_or_create_picker(key, on_result):
+        p = page.session.get(key)
+        if not p:
+            p = ft.FilePicker(on_result=on_result)
+            page.session.set(key, p)
+            page.overlay.append(p)
+        else:
+            p.on_result = on_result
+        return p
 
     # 2. Clase Interceptora (Proxy Pattern): Traduce el progreso crudo a porcentaje visual
     class ProgressInterceptor:
@@ -91,8 +105,7 @@ def build_imputacion_view(page: ft.Page):
                 page.snack_bar = ft.SnackBar(ft.Text(f"❌ Error al guardar: {ex}"), bgcolor="red", open=True)
             page.update()
 
-    picker_exportar_csv = ft.FilePicker(on_result=manejar_exportacion)
-    page.overlay.append(picker_exportar_csv)
+    picker_exportar_csv = _get_or_create_picker("imput_picker_exportar_csv", manejar_exportacion)
     
     # --- SISTEMA DE EXPORTACIÓN LOG INDIVIDUAL (QA) ---
     log_a_exportar = [None]
@@ -101,22 +114,28 @@ def build_imputacion_view(page: ft.Page):
             try:
                 import datetime
                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                texto_log = str(log_a_exportar[0])
+                if not texto_log.startswith("==="):
+                    header = (
+                        "=================================================================\n"
+                        " REPORTE DE CONTROL DE CALIDAD (QA) - IMPUTACIÓN MATEMÁTICA\n"
+                        "=================================================================\n"
+                        f" Fecha de Descarga : {timestamp}\n"
+                        "=================================================================\n\n"
+                    )
+                    footer = "\n\n=================================================================\n FIN DEL REPORTE\n"
+                    texto_final = header + texto_log + footer
+                else:
+                    texto_final = texto_log
+
                 with open(e.path, 'w', encoding='utf-8') as f:
-                    f.write("=================================================================\n")
-                    f.write(" REPORTE DE CONTROL DE CALIDAD (QA) - IMPUTACIÓN MATEMÁTICA\n")
-                    f.write("=================================================================\n")
-                    f.write(f" Fecha de Descarga : {timestamp}\n")
-                    f.write("=================================================================\n\n")
-                    f.write(log_a_exportar[0])
-                    f.write("\n\n=================================================================\n")
-                    f.write(" FIN DEL REPORTE\n")
+                    f.write(texto_final)
                 page.snack_bar = ft.SnackBar(ft.Text("✅ Informe QA Exportado con Éxito"), bgcolor="#00f0ff", open=True)
             except Exception as ex:
                 page.snack_bar = ft.SnackBar(ft.Text(f"❌ Error al guardar log: {ex}"), bgcolor="red", open=True)
             page.update()
 
-    picker_exportar_log = ft.FilePicker(on_result=manejar_exportacion_log)
-    page.overlay.append(picker_exportar_log)
+    picker_exportar_log = _get_or_create_picker("imput_picker_exportar_log", manejar_exportacion_log)
     
     # --- SISTEMA DE EXPORTACIÓN THIESSEN ---
     def manejar_exportacion_thiessen(e: ft.FilePickerResultEvent):
@@ -141,8 +160,7 @@ def build_imputacion_view(page: ft.Page):
                 page.snack_bar = ft.SnackBar(ft.Text(f"❌ Error al calcular Thiessen: {ex}"), bgcolor="red", open=True)
             page.update()
 
-    picker_exportar_thiessen = ft.FilePicker(on_result=manejar_exportacion_thiessen)
-    page.overlay.append(picker_exportar_thiessen)
+    picker_exportar_thiessen = _get_or_create_picker("imput_picker_exportar_thiessen", manejar_exportacion_thiessen)
     # ------------------------------------------------
     
     # Controles de Texto y Estado
@@ -200,13 +218,25 @@ def build_imputacion_view(page: ft.Page):
             selected_output_folder.value = f"Destino: {e.path}"
             page.update()
 
-    file_picker_input = ft.FilePicker(on_result=on_input_dir_result)
-    file_picker_output = ft.FilePicker(on_result=on_output_dir_result)
-    page.overlay.extend([file_picker_input, file_picker_output])
+    file_picker_input = _get_or_create_picker("imput_file_picker_input", on_input_dir_result)
+    file_picker_output = _get_or_create_picker("imput_file_picker_output", on_output_dir_result)
 
     # ==========================================
     # 4. LÓGICA DE COLA, MEMORIA E INSPECCIÓN
     # ==========================================
+    def _resolver_ruta_bd():
+        """Resuelve de forma robusta la ruta hacia el archivo SQLite/GeoPackage activo (.hds)."""
+        ruta_bd = page.session.get("current_project_path")
+        if not ruta_bd:
+            ruta_bd = page.session.get("ruta_bd_activa")
+        if not ruta_bd:
+            out_folder = page.session.get("imput_output_folder") or os.getcwd()
+            ruta_bd = os.path.join(out_folder, "HyDaS_Proyecto.hds")
+            page.session.set("current_project_path", ruta_bd)
+
+        from core.imputacion_logic import resolver_ruta_hds
+        return resolver_ruta_hds(ruta_bd)
+
     def agregar_a_cola(sid):
         cola = page.session.get("cola_imputacion")
         if sid not in cola:
@@ -254,13 +284,16 @@ def build_imputacion_view(page: ft.Page):
         def _trigger_download(sid):
             try:
                 import sqlite3
-                ruta_bd = page.session.get("ruta_bd_activa")
-                if not ruta_bd or not os.path.exists(ruta_bd):
-                    raise Exception("Base de datos no disponible")
+                ruta_hds = _resolver_ruta_bd()
+                if not ruta_hds or not os.path.exists(ruta_hds):
+                    raise Exception("Base de datos no disponible.")
                     
-                conn = sqlite3.connect(ruta_bd)
+                conn = sqlite3.connect(ruta_hds)
                 df = pd.read_sql_query(f"SELECT * FROM serie_imputada_{sid}", conn)
                 conn.close()
+                
+                if df.empty:
+                    raise Exception(f"No hay datos registrados para la estación {sid}.")
                 
                 estacion_a_exportar[0] = df
                 picker_exportar_csv.save_file(
@@ -269,24 +302,75 @@ def build_imputacion_view(page: ft.Page):
                     allowed_extensions=["csv"]
                 )
             except Exception as e:
-                page.snack_bar = ft.SnackBar(ft.Text(f"Error al exportar de BD: {e}"), bgcolor="red", open=True)
+                page.snack_bar = ft.SnackBar(ft.Text(f"❌ Error al exportar de BD: {e}"), bgcolor="red", open=True)
                 page.update()
 
-        def _trigger_download_log(sid, data_dict):
-            log_text = data_dict.get("log", "")
-            log_path_src = data_dict.get("log_path")
+        def _trigger_download_log(sid, data_dict=None):
+            if data_dict is None:
+                db_crudas = page.session.get("db_series_crudas") or {}
+                data_dict = db_crudas.get(sid, {})
+                
+            log_text = data_dict.get("log", "") if isinstance(data_dict, dict) else ""
+            log_path_src = data_dict.get("log_path") if isinstance(data_dict, dict) else None
+            
             if log_path_src and os.path.exists(log_path_src):
                 try:
                     with open(log_path_src, "r", encoding="utf-8") as f:
                         log_text = f.read()
                 except Exception:
                     pass
+                    
+            if not log_text:
+                ruta_hds = _resolver_ruta_bd()
+                log_text = imputacion_logic.obtener_log_de_sqlite_hds(sid, ruta_hds)
+                
+            if not log_text:
+                log_text = f"Informe de control de calidad para estación {sid}.\nProceso de imputación finalizado."
+                
             log_a_exportar[0] = log_text
             picker_exportar_log.save_file(
                 dialog_title=f"Descargar Informe QA de {sid}",
                 file_name=f"QA_Log_{sid}.txt",
                 allowed_extensions=["txt"]
             )
+
+        def _eliminar_registro(sid):
+            try:
+                # 1. Eliminar de la sesión activa
+                db_session = page.session.get("db_series_crudas") or {}
+                if sid in db_session:
+                    del db_session[sid]
+                    page.session.set("db_series_crudas", db_session)
+                    
+                # 2. Eliminar de la base de datos SQLite (.gpkg / .hds)
+                ruta_hds = _resolver_ruta_bd()
+                imputacion_logic.eliminar_estacion_de_sqlite_hds(sid, ruta_hds)
+                
+                # 3. Refrescar interfaz gráfica
+                render_visor_resultados()
+                estaciones_actuales = page.session.get("imput_station_files") or {}
+                restore_station_ui(estaciones_actuales, actualizar_textos=False)
+                
+                page.snack_bar = ft.SnackBar(ft.Text(f"🗑️ Registro de imputación de {sid} eliminado."), bgcolor="orange", open=True)
+                page.update()
+            except Exception as ex:
+                page.snack_bar = ft.SnackBar(ft.Text(f"❌ Error al eliminar {sid}: {ex}"), bgcolor="red", open=True)
+                page.update()
+
+        def _confirmar_eliminar(sid):
+            dialog_confirm = ft.AlertDialog(
+                title=ft.Row([
+                    ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, color="red"),
+                    ft.Text("Confirmar Eliminación", color="white", weight="bold")
+                ]),
+                content=ft.Text(f"¿Deseas eliminar el registro de imputación de la estación {sid}? Esta acción borrará los datos calculados de la sesión y de la base de datos."),
+                actions=[
+                    ft.TextButton("Cancelar", on_click=lambda _: page.close(dialog_confirm)),
+                    ft.ElevatedButton("Eliminar", bgcolor="red", color="white", on_click=lambda _: [page.close(dialog_confirm), _eliminar_registro(sid)])
+                ],
+                actions_alignment=ft.MainAxisAlignment.END
+            )
+            page.open(dialog_confirm)
 
         for sid, data in db.items():
             visor_resultados_grid.controls.append(
@@ -299,7 +383,9 @@ def build_imputacion_view(page: ft.Page):
                         # Botón Exportar CSV
                         ft.IconButton(ft.Icons.DOWNLOAD, icon_color="#00f0ff", icon_size=16, tooltip="Exportar a CSV", on_click=lambda e, s=sid: _trigger_download(s)),
                         # Botón Exportar Informe QA (LOG)
-                        ft.IconButton(ft.Icons.RECEIPT_LONG, icon_color="orange", icon_size=16, tooltip="Descargar Informe QA", on_click=lambda e, s=sid, d=data: _trigger_download_log(s, d))
+                        ft.IconButton(ft.Icons.RECEIPT_LONG, icon_color="orange", icon_size=16, tooltip="Descargar Informe QA", on_click=lambda e, s=sid, d=data: _trigger_download_log(s, d)),
+                        # Botón Eliminar Registro de Imputación
+                        ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_color="#ff5555", icon_size=16, tooltip="Eliminar Registro de Imputación", on_click=lambda e, s=sid: _confirmar_eliminar(s))
                     ]),
                     bgcolor="#1e2a1e", padding=5, border_radius=8
                 )
@@ -307,49 +393,86 @@ def build_imputacion_view(page: ft.Page):
         page.update()
 
     def abrir_inspeccion(sid):
-        data = page.session.get("db_series_crudas").get(sid)
-        if not data: return
-        # Leemos los últimos 5 registros directamente de SQLite (Protección OOM)
+        db_crudas = page.session.get("db_series_crudas") or {}
+        data = db_crudas.get(sid) or {}
+        
+        # Leemos los datos directamente de SQLite (Protección OOM)
         import sqlite3
-        ruta_bd = page.session.get("ruta_bd_activa")
+        ruta_hds = _resolver_ruta_bd()
         df_tail = pd.DataFrame()
-        if ruta_bd and os.path.exists(ruta_bd):
+        total_filas = 0
+        
+        if ruta_hds and os.path.exists(ruta_hds):
             try:
-                conn = sqlite3.connect(ruta_bd)
-                query = f"SELECT * FROM serie_imputada_{sid} ORDER BY FECHA DESC LIMIT 5"
+                conn = sqlite3.connect(ruta_hds)
+                try:
+                    cur = conn.cursor()
+                    cur.execute(f"SELECT COUNT(*) FROM serie_imputada_{sid}")
+                    total_filas = cur.fetchone()[0]
+                except Exception:
+                    pass
+                    
+                query = f"SELECT * FROM serie_imputada_{sid} ORDER BY rowid DESC LIMIT 8"
                 df_tail = pd.read_sql_query(query, conn)
                 df_tail = df_tail.iloc[::-1] # Invertimos para que quede cronológico
                 conn.close()
-            except Exception:
-                pass
+            except Exception as ex:
+                print(f"Error inspección SQLite: {ex}")
                 
         if df_tail.empty:
-            df_tail = pd.DataFrame({"INFO": ["Datos no disponibles en BD"]})
+            df_preview_str = "Datos no disponibles en BD."
+        else:
+            cols_show = [c for c in ['FECHA', 'PRECIP', 'PRECIP_ORIGINAL', 'clave_estacion'] if c in df_tail.columns]
+            if not cols_show: cols_show = df_tail.columns[:5].tolist()
+            df_preview_str = f"Total de registros: {total_filas}\n\n" + df_tail[cols_show].to_string(index=False)
             
-        log_text = "Log no disponible."
-        if "log_path" in data and data["log_path"] and os.path.exists(data["log_path"]):
-            try:
-                with open(data["log_path"], "r", encoding="utf-8") as f:
-                    log_text = f.read()
-            except Exception:
-                pass
-        elif "log" in data:
-            log_text = data.get("log", "")
+        log_text = ""
+        if isinstance(data, dict):
+            if "log_path" in data and data["log_path"] and os.path.exists(data["log_path"]):
+                try:
+                    with open(data["log_path"], "r", encoding="utf-8") as f:
+                        log_text = f.read()
+                except Exception:
+                    pass
+            if not log_text and "log" in data:
+                log_text = data.get("log", "")
+                
+        if not log_text:
+            log_text = imputacion_logic.obtener_log_de_sqlite_hds(sid, ruta_hds)
+            
+        if not log_text:
+            log_text = "Registro de log de calidad no disponible en memoria."
             
         dialog = ft.AlertDialog(
-            title=ft.Text(f"Inspección: {sid}", color=COLOR_ACENTO),
-            content=ft.Column([
-                ft.Text("Muestra de datos (Últimos 5):", weight="bold"),
-                ft.Container(content=ft.Text(df_tail.to_string(index=False), size=9, font_family="monospace"), bgcolor="black", padding=10),
-                ft.Divider(),
-                ft.Text("Log de Calidad:", weight="bold"),
-                # FIX: Se usa Column dentro de Container para habilitar el scroll
-                ft.Container(content=ft.Column([ft.Text(log_text[:800] + "...", size=11, color="grey")], scroll=ft.ScrollMode.AUTO), height=150)
-            ], tight=True, width=500),
-            # --- ADAPTACIÓN FLET 0.28+: Cierre seguro mediante método atómico de página ---
-            actions=[ft.TextButton("Cerrar", on_click=lambda _: page.close(dialog))]
+            title=ft.Row([
+                ft.Icon(ft.Icons.INSIGHTS, color=COLOR_ACENTO),
+                ft.Text(f"Inspección: Estación {sid}", color=COLOR_ACENTO, weight="bold")
+            ]),
+            content=ft.Container(
+                content=ft.Column([
+                    ft.Text("Muestra de datos (Últimos registros):", weight="bold", size=13, color="white"),
+                    ft.Container(
+                        content=ft.Text(df_preview_str, size=10, font_family="monospace", color="#00f0ff"), 
+                        bgcolor="#0a0a0a", padding=10, border_radius=6, border=ft.border.all(1, "#333333")
+                    ),
+                    ft.Divider(height=15, color="#333333"),
+                    ft.Text("Log de Calidad (QA):", weight="bold", size=13, color="white"),
+                    ft.Container(
+                        content=ft.ListView([
+                            ft.Text(log_text, size=11, color="#cccccc", font_family="monospace")
+                        ], auto_scroll=False), 
+                        height=180, bgcolor="#0a0a0a", padding=10, border_radius=6, border=ft.border.all(1, "#333333")
+                    )
+                ], tight=True, spacing=8),
+                width=650
+            ),
+            actions=[
+                ft.TextButton("Descargar CSV", icon=ft.Icons.DOWNLOAD, on_click=lambda _: [_trigger_download(sid)]),
+                ft.TextButton("Descargar QA Log", icon=ft.Icons.RECEIPT_LONG, on_click=lambda _: [_trigger_download_log(sid, data)]),
+                ft.ElevatedButton("Cerrar", bgcolor=COLOR_ACENTO, color="black", on_click=lambda _: page.close(dialog))
+            ],
+            actions_alignment=ft.MainAxisAlignment.END
         )
-        # --- ADAPTACIÓN FLET 0.28+: Evitamos la asignación obsoleta 'page.dialog = x' que causaba el fallo ---
         page.open(dialog)
 
     # ==========================================
@@ -424,26 +547,29 @@ def build_imputacion_view(page: ft.Page):
                     )
                     
                     if df_res is not None:
-                        # Guardado Seguro en Parquet
-                        # --- NUEVO: PERSISTENCIA DIRECTA A BASE DE DATOS (.GPKG) ---
-                        # Eliminamos la generación en caliente de CSV y Parquet para maximizar rendimiento
-                        # El usuario exportará los CSV cuando los solicite desde el UI.
-                        ruta_bd = page.session.get("ruta_bd_activa")
+                        ruta_bd = _resolver_ruta_bd()
                         if ruta_bd:
                             imputacion_logic.guardar_en_sqlite_hds(df_res, sid, ruta_bd)
+                            if log_msg:
+                                imputacion_logic.guardar_log_en_sqlite_hds(log_msg, sid, ruta_bd)
                             print(f"📦 Estación {sid} inyectada en SQLite con éxito.")
                             
-                        # El LOG se mantiene como texto en memoria o se guarda si el usuario lo requiere
-                        log_path = None # Optimización de velocidad
+                        out_folder = page.session.get("imput_output_folder")
+                        log_path = None
+                        if out_folder and os.path.exists(out_folder) and log_msg:
+                            log_path = imputacion_logic.save_imputation_log(log_msg, sid, out_folder)
                         
-                        # Actualizar db_crudas para marcarla como imputada
-                        db_crudas[sid] = {"log_path": log_path, "imputada": True}
+                        # Actualizar db_crudas para marcarla como imputada y conservar el log para inspección/exportación
+                        db_crudas[sid] = {
+                            "log_path": log_path,
+                            "log": log_msg,
+                            "imputada": True
+                        }
                         
                         log_radiactivo(f"✅ Estación {sid} procesada y guardada con éxito.")
                         
                         # LIMPIADO DE MEMORIA (Protección OOM)
                         del df_res
-                        del log_msg
                 except Exception as ex:
                     log_radiactivo(f"❌ Error crítico en {sid}: {ex}")
                 
@@ -578,21 +704,26 @@ def build_imputacion_view(page: ft.Page):
                         )
                         
                         if df_res is not None:
-                            # --- NUEVO: PERSISTENCIA DIRECTA A BASE DE DATOS (.GPKG) ---
-                            # Sin CSV ni Parquet, todo va al SQLite como fuente única de verdad.
-                            ruta_bd = page.session.get("ruta_bd_activa")
+                            ruta_bd = _resolver_ruta_bd()
                             if ruta_bd:
                                 imputacion_logic.guardar_en_sqlite_hds(df_res, sid, ruta_bd)
+                                if log_msg:
+                                    imputacion_logic.guardar_log_en_sqlite_hds(log_msg, sid, ruta_bd)
                                 print(f"📦 Estación {sid} inyectada en SQLite con éxito.")
                                 
-                            # AÑADIENDO FLAG "imputada = True" (Requisito Módulo 4)
+                            out_folder = page.session.get("imput_output_folder")
+                            log_path = None
+                            if out_folder and os.path.exists(out_folder) and log_msg:
+                                log_path = imputacion_logic.save_imputation_log(log_msg, sid, out_folder)
+
                             db_crudas[sid] = {
-                                "log_path": None,
+                                "log_path": log_path,
+                                "log": log_msg,
                                 "imputada": True
                             }
                             log_radiactivo(f"✅ Estación {sid} completada.")
                             
-                            del df_res, log_msg
+                            del df_res
                     except Exception as ex:
                         log_radiactivo(f"❌ Error crítico en {sid}: {ex}")
                     

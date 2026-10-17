@@ -18,6 +18,8 @@ if os.path.exists(_fiona_proj):
     os.environ["PROJ_DATA"] = _fiona_proj
 # --------------------------------------------------------
 
+from core.proyecciones_mx import estandarizar_a_wgs84_utm, EPSG_A_ZONA, ZONAS_UTM_MEXICO
+
 # Definición del CRS oficial del sistema (UTM Zona 14N por defecto, parametrizable)
 DEFAULT_CRS = "EPSG:32614"
 
@@ -42,64 +44,136 @@ class MotorEspacial:
         return gdf
 
     @staticmethod
-    def procesar_cuenca_objetivo(ruta_shp: str, buffer_km: int = 100) -> dict:
+    def ingerir_cuencas_zero_trust(ruta_shp: str, epsg_utm: int = None) -> dict:
         """
-        Ingesta, valida y proyecta la Cuenca Objetivo (Zero-Trust).
-        Aplica una 'Caja de Arena Métrica' para cálculos de área y buffers,
-        y retorna geometrías en WGS84 para UI y Base de Datos.
+        [ADUANA ESPACIAL] Procesa un shapefile que puede contener una o múltiples subcuencas.
+        Estandariza obligatoriamente a WGS 84 / UTM en las zonas 11N a 16N de México.
+        Retorna la geometría agrupada (Convex Hull), metadatos de proyección y suma de áreas.
         """
         try:
-            # 1. Ingesta Defensiva (Aduana Espacial)
-            cuenca_gdf = gpd.read_file(ruta_shp)
-            if cuenca_gdf.empty:
-                raise ValueError("El Shapefile está vacío o carece de geometría.")
+            # 1. Lectura y Validación (Zero-Trust)
+            gdf = gpd.read_file(ruta_shp)
+            if gdf.empty:
+                raise ValueError("El archivo Shapefile proporcionado está vacío o corrupto.")
 
-            # 2. Diagnóstico y Auto-Curación del CRS original
-            if cuenca_gdf.crs is None:
-                # Si el creador no incluyó archivo .prj, evaluamos por heurística
-                minx, miny, maxx, maxy = cuenca_gdf.total_bounds
-                if maxx > 180 or minx < -180:
-                    cuenca_gdf.set_crs("EPSG:32614", inplace=True) # Asumimos UTM Zona 14N
-                else:
-                    cuenca_gdf.set_crs("EPSG:4326", inplace=True)  # Asumimos Geográficas
-            
-            # 3. CAJA DE ARENA MÉTRICA (Proyección temporal)
-            # EPSG:3857 preserva el cálculo matemático en Metros.
-            cuenca_metrica = cuenca_gdf.to_crs("EPSG:3857")
+            # 2. Normalización Vectorizada y Reproyección a WGS84 UTM México (11N a 16N)
+            zona_forzada = EPSG_A_ZONA.get(epsg_utm) if epsg_utm else None
+            gdf, meta_crs = estandarizar_a_wgs84_utm(
+                gdf, zona_forzada=zona_forzada, nombre_capa=os.path.basename(ruta_shp)
+            )
 
-            # 4. Cálculo Matemático de Área (Estricto en km²)
-            area_m2 = cuenca_metrica.geometry.area.sum()
-            area_km2 = area_m2 / 1_000_000.0
+            # 3. Cálculo Vectorizado de Áreas Individuales y Totales
+            gdf['area_km2'] = gdf.geometry.area / 1e6
+            area_total = float(gdf['area_km2'].sum())
+            num_subcuencas = len(gdf)
 
-            # 5. Generación de Buffer en metros (100 km = 100,000 m)
-            buffer_metrico = cuenca_metrica.copy()
-            buffer_metrico.geometry = cuenca_metrica.geometry.buffer(buffer_km * 1000)
+            # 4. Geometría Envolvente para el Buffer de Extracción (Convex Hull)
+            geometria_maestra = gdf.unary_union.convex_hull
 
-            # 6. Reproyección de Salida a WGS84 (EPSG:4326) para Motor Gráfico y Relacional
-            cuenca_geo = cuenca_metrica.to_crs("EPSG:4326")
-            buffer_geo = buffer_metrico.to_crs("EPSG:4326")
-
-            # 7. Conversión a GeoJSON (Geometría pura Polygon/MultiPolygon para el Canvas de Flet)
-            cuenca_geojson = cuenca_geo.geometry.unary_union.__geo_interface__
-            buffer_geojson = buffer_geo.geometry.unary_union.__geo_interface__
-            bbox = list(buffer_geo.total_bounds) # [minx, miny, maxx, maxy]
-
-            # 8. Recolección de basura explícita (Protección de RAM)
-            del cuenca_gdf, cuenca_metrica, buffer_metrico
-            gc.collect()
+            print(f"|> [MOTOR ESPACIAL] Ingesta exitosa: {num_subcuencas} subcuenca(s) estandarizadas a {meta_crs['nombre_crs']}. Área Total: {area_total:.2f} km²")
 
             return {
-                "area_km2": round(area_km2, 2),
-                "buffer_geom": buffer_geo.geometry.unary_union, # Unifica polígonos divididos si los hay
-                "cuenca_geojson": cuenca_geojson,
-                "buffer_geojson": buffer_geojson,
-                "bbox": bbox,
-                "arf_activado": area_km2 > 25.0
+                "exito": True,
+                "gdf_cuencas": gdf,
+                "area_total_km2": area_total,
+                "num_subcuencas": num_subcuencas,
+                "wkt_envolvente": geometria_maestra.wkt,
+                "crs_info": meta_crs
             }
 
         except Exception as e:
+            print(f"[CRÍTICO] Fallo en la Aduana Espacial al leer SHP.")
             traceback.print_exc()
-            raise RuntimeError(f"Rechazo en Aduana Espacial: {str(e)}")
+            return {"exito": False, "error": str(e)}
+            
+        finally:
+            # Directriz 1: Liberación de memoria C++ de GEOS/GDAL
+            gc.collect()
+
+    @staticmethod
+    def calcular_area_cuenca_async(ruta_shapefile: str, epsg_utm: int, page, buffer_km: int = 100, on_success=None, on_error=None) -> None:
+        """
+        Motor espacial asíncrono para el cálculo del área de la cuenca.
+        """
+        import threading
+        import traceback
+        import gc
+        
+        def _task():
+            try:
+                # 1. Ingesta Defensiva y Zero-Trust (Multicuenca via Aduana Espacial)
+                res_ingesta = MotorEspacial.ingerir_cuencas_zero_trust(ruta_shapefile, epsg_utm)
+                if not res_ingesta["exito"]:
+                    raise ValueError(res_ingesta.get("error", "Error en ingesta multicuenca."))
+                    
+                gdf = res_ingesta["gdf_cuencas"]
+                area_total = res_ingesta["area_total_km2"]
+                wkt_envolvente = res_ingesta["wkt_envolvente"]
+                
+                print(f"|> [NÚCLEO FÍSICO] Área computada: {area_total:.4f} km² ({res_ingesta['num_subcuencas']} subcuencas)")
+                
+                # Generación de Buffer desde el polígono envolvente (Convex Hull)
+                from shapely import wkt
+                geom_env = wkt.loads(wkt_envolvente)
+                buffer_metrico_geom = geom_env.buffer(buffer_km * 1000)
+                buffer_gs_utm = gpd.GeoSeries([buffer_metrico_geom], crs=f"EPSG:{epsg_utm}")
+                buffer_gs_geo = buffer_gs_utm.to_crs("EPSG:4326")
+                buffer_geom_geo = buffer_gs_geo.iloc[0]
+
+                # Reproyección a WGS84 para UI
+                cuenca_geo = gdf.to_crs("EPSG:4326")
+                
+                cuenca_geojson = cuenca_geo.geometry.unary_union.__geo_interface__
+                buffer_geojson = buffer_geom_geo.__geo_interface__
+                bbox = list(buffer_gs_geo.total_bounds)
+                
+                # 5. Persistencia en la sesión de la UI si page está disponible
+                if page is not None and hasattr(page, "session"):
+                    page.session.set('area_cuenca_km2', round(area_total, 2))
+                    page.session.set('gdf_multicuenca', gdf)
+                    page.session.set('wkt_envolvente_busqueda', wkt_envolvente)
+                    page.session.set('cuenca_geojson', cuenca_geojson)
+                    page.session.set('buffer_geojson', buffer_geojson)
+                    page.session.set('cuenca_bbox', bbox)
+                    page.session.set('arf_activado', area_total > 25.0)
+                    page.session.set('es_multicuenca_arf', area_total > 25.0)
+                    page.session.set('buffer_geom', buffer_geom_geo)
+                    page.session.set('buffer_geom_shapely', buffer_geom_geo)
+                
+                if on_success:
+                    if page is not None and hasattr(page, "run_thread"):
+                        page.run_thread(on_success)
+                    else:
+                        on_success()
+    
+            except Exception as e:
+                print(f"[CRÍTICO] Fallo en motor espacial (Cálculo de Área).")
+                traceback.print_exc()
+                
+                if page is not None and hasattr(page, "snack_bar"):
+                    try:
+                        import flet as ft
+                        page.snack_bar = ft.SnackBar(
+                            content=ft.Text(f"ERROR: Cálculo de Área falló. Detalle: {str(e)}", color="#ffffff"),
+                            bgcolor="#cc0000",
+                            open=True
+                        )
+                        page.update()
+                    except Exception:
+                        pass
+                if on_error:
+                    if page is not None and hasattr(page, "run_thread"):
+                        page.run_thread(on_error)
+                    else:
+                        on_error()
+                
+            finally:
+                if 'gdf' in locals(): del gdf
+                if 'cuenca_geo' in locals(): del cuenca_geo
+                gc.collect()
+    
+        # Disparo asíncrono para liberar el hilo principal (GIL)
+        threading.Thread(target=_task, daemon=True).start()
 
     @staticmethod
     def exportar_plantilla_shp(schema_class, tipo_geometria: str, ruta_salida: str, crs=DEFAULT_CRS):

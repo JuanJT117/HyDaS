@@ -7,6 +7,13 @@ import logging
 # Evitar doble inicialización del logger
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.DEBUG)
+
+# Silenciar mensajes excesivamente verbosos de bibliotecas auxiliares
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
+logging.getLogger("flet").setLevel(logging.INFO)
+logging.getLogger("flet_core").setLevel(logging.INFO)
+logging.getLogger("PIL").setLevel(logging.WARNING)
 ##
 #   ├── main.py                     # Punto de entrada estricto (App Shell)
 #   ├── core/                       # BACKEND: Lógica pura, matemáticas y algoritmos
@@ -161,6 +168,39 @@ def main(page: ft.Page):
     # Esta lista guardará las referencias a los botones de Matrix que queremos controlar
     menu_buttons = [] 
     
+    # --- MOTOR DE EXTRACCIÓN Y AUTOGUARDADO CONTINUO (FASE 3) ---
+    def _extract_serializable_session():
+        """Extrae de page.session los tensores y datos serializables filtrando controles Flet."""
+        session_dict = {}
+        BLACKLIST_KEYS = ["catalogo_conagua", "df_estaciones_nacionales", "db_climatologica_masiva"]
+        for k in page.session.get_keys():
+            val = page.session.get(k)
+            if callable(val) or isinstance(val, ft.Control) or "flet" in type(val).__module__:
+                continue
+            if k in BLACKLIST_KEYS:
+                continue
+            session_dict[k] = val
+        return session_dict
+
+    def trigger_autosave(silent=True, modulo_origen=None):
+        """Dispara el autoguardado en segundo plano sin congelar la UI de Flet."""
+        path = page.session.get("current_project_path")
+        if not path:
+            return
+        def _bg_autosave():
+            try:
+                s_dict = _extract_serializable_session()
+                project_manager_instance.save_project(path, s_dict)
+                del s_dict
+                if modulo_origen:
+                    project_manager_instance.registrar_auditoria("AUTOSAVE", "CHECKPOINT", f"Checkpoint silencioso desde {modulo_origen}")
+            except Exception as e:
+                if not silent:
+                    print(f"[WARN] Autosave error: {e}", file=sys.stderr)
+        threading.Thread(target=_bg_autosave, daemon=True).start()
+
+    page.session.set("trigger_autosave", trigger_autosave)
+
     # --- LÓGICA DE NAVEGACIÓN Y CARGA ---
     
     def show_dashboard():
@@ -169,6 +209,7 @@ def main(page: ft.Page):
         
         # --- LÓGICA DE RETORNO A INICIO CORREGIDA ---
         def return_to_welcome_screen():
+            project_manager_instance.set_session_activa(False)
             # Forzamos la reactivación de todo el sistema de navegación
             main_rail = page.session.get("main_rail")
             if main_rail:
@@ -225,40 +266,15 @@ def main(page: ft.Page):
                         if path:
                             gc.collect()
                             time.sleep(0.2)
-                            
-                            # --- NUEVO MOTOR DE EXTRACCIÓN ZERO-TRUST ---
-                            session_dict = {}
-                            # REGLA DE DOMINIO: Variables masivas de consulta que NO se empaquetan.
-                            # NOTA: "db_series_crudas" YA NO se bloquea porque ahora usa Lazy Loading (Punteros).
-                            BLACKLIST_KEYS = [
-                                "catalogo_conagua", "df_estaciones_nacionales", "db_climatologica_masiva"
-                            ]
-
-                            for k in page.session.get_keys():
-                                val = page.session.get(k)
-                                
-                                # 1. Filtro de Interfaz (Evita crash del serializador JSON)
-                                if callable(val) or isinstance(val, ft.Control) or "flet" in type(val).__module__:
-                                    continue
-                                    
-                                # 2. Filtro Anti-OOM (Out Of Memory)
-                                if k in BLACKLIST_KEYS:
-                                    continue
-                                    
-                                session_dict[k] = val
-                            
-                            # Validamos el resultado booleano aplicando Manejo Defensivo
+                            session_dict = _extract_serializable_session()
                             exito = project_manager_instance.save_project(path, session_dict)
-                            
-                            # --- LIMPIEZA EXTREMA RAM EXPLICITA ---
                             del session_dict
-                            import gc
                             gc.collect()
 
                             if not exito:
                                 raise RuntimeError("El motor de persistencia abortó la escritura. Revisa la terminal para ver el traceback JSON.")
                         
-                        time.sleep(0.5) # Holgura para asegurar la integridad de la escritura en disco
+                        time.sleep(0.5)
                         
                         # --- LIMPIEZA FINAL SESION ---
                         page.session.clear()
@@ -347,6 +363,11 @@ def main(page: ft.Page):
                 rail.selected_index = page.session.get("last_nav_index") or 0
                 page.update()
                 return
+
+            # Autoguardado preventivo en background del módulo saliente
+            last_idx = page.session.get("last_nav_index")
+            if last_idx is not None and last_idx != index:
+                trigger_autosave(silent=True, modulo_origen=f"Modulo_{last_idx}")
 
             is_navigating[0] = True
             page.session.set("last_nav_index", index)
@@ -485,10 +506,31 @@ def main(page: ft.Page):
                     
                     backup = page.session.get("txt_backup")
                     if backup and isinstance(backup, dict) and "path" in backup:
-                        page.session.set("imput_folder_path", backup["path"])
+                        imput_dir = backup["path"]
+                        page.session.set("imput_folder_path", imput_dir)
+                        # Re-vincular los paths en imput_station_files a la nueva carpeta descomprimida
+                        station_files = page.session.get("imput_station_files") or {}
+                        if os.path.exists(imput_dir):
+                            nuevos_station_files = {}
+                            archivos_en_disco = {f.upper(): f for f in os.listdir(imput_dir) if f.endswith(".txt")}
+                            for sid, old_filepath in station_files.items():
+                                fname = os.path.basename(old_filepath) if old_filepath else f"{sid}.txt"
+                                if fname.upper() in archivos_en_disco:
+                                    nuevos_station_files[sid] = os.path.join(imput_dir, archivos_en_disco[fname.upper()])
+                                else:
+                                    posibles = [f for f in os.listdir(imput_dir) if f.startswith(str(sid))]
+                                    if posibles:
+                                        nuevos_station_files[sid] = os.path.join(imput_dir, posibles[0])
+                                    else:
+                                        nuevos_station_files[sid] = os.path.join(imput_dir, fname)
+                            page.session.set("imput_station_files", nuevos_station_files)
                     
                     page.session.set("current_project_path", path)
                     
+                    # Verificación de crash recovery previo
+                    recuperado_de_crash = project_manager_instance.verificar_recuperacion_sesion()
+                    project_manager_instance.set_session_activa(True)
+
                     _prog(1.0)
                     _log("✅ Inicialización completa. Lanzando entorno de trabajo...")
                     time.sleep(0.6) # Pausa estética para que el usuario aprecie el "100%"
@@ -496,6 +538,12 @@ def main(page: ft.Page):
                     def _finalize():
                         overlay_carga_proyecto.visible = False
                         show_dashboard()
+                        if recuperado_de_crash:
+                            page.snack_bar = ft.SnackBar(
+                                ft.Text("⚠️ El proyecto fue restaurado tras un cierre inesperado previo. Estado recuperado íntegro.", color="white", weight="bold"),
+                                bgcolor="orange", open=True
+                            )
+                            page.update()
                     page.run_thread(_finalize)
                     
                 except Exception as ex:
@@ -532,9 +580,10 @@ def main(page: ft.Page):
             # Forzar la extensión .hds si el usuario la omitió en el cuadro de diálogo
             path = e.path if e.path.endswith(".hds") else e.path + ".hds"
             try:
-                # Crear un archivo inicial vacío pero con la estructura .hds (.tar.xz)
+                page.session.clear()
                 project_manager_instance.save_project(path, {"status": "new_project"})
                 page.session.set("current_project_path", path)
+                project_manager_instance.set_session_activa(True)
                 show_dashboard()
             except Exception as ex:
                 page.snack_bar = ft.SnackBar(ft.Text(f"Error al crear: {str(ex)}"), bgcolor="red")
@@ -567,33 +616,9 @@ def main(page: ft.Page):
                 gc.collect() # Limpieza de memoria previa
                 time.sleep(0.2) # Estabilización del buffer visual
                 
-                # Extracción de datos rigurosa para formato JSON/Parquet
-                # --- NUEVO MOTOR DE EXTRACCIÓN ZERO-TRUST ---
-                session_dict = {}
-                # REGLA DE DOMINIO: Variables masivas de consulta que NO se empaquetan en el .hds
-                BLACKLIST_KEYS = [
-                    "catalogo_conagua", "df_estaciones_nacionales", "db_climatologica_masiva" 
-                ]
-
-                for k in page.session.get_keys():
-                    val = page.session.get(k)
-                    
-                    # 1. Filtro de Interfaz (Evita crash del serializador JSON)
-                    if callable(val) or isinstance(val, ft.Control) or "flet" in type(val).__module__:
-                        continue
-                        
-                    # 2. Filtro Anti-OOM (Out Of Memory)
-                    if k in BLACKLIST_KEYS:
-                        continue
-                        
-                    session_dict[k] = val
-                        
-                # Volcado a disco duro (.hds) con validación estricta
+                session_dict = _extract_serializable_session()
                 exito = project_manager_instance.save_project(path, session_dict)
-                
-                # --- LIMPIEZA EXTREMA RAM EXPLICITA ---
                 del session_dict
-                import gc
                 gc.collect()
 
                 if not exito:

@@ -15,6 +15,8 @@ class Proyecto(Base):
     fecha_creacion = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     autor = Column(String, default="HidroSistem User")
     crs_epsg = Column(Integer, default=32614)  # Forzar proyección UTM por defecto
+    version_esquema = Column(String, default="11.2")
+    session_activa = Column(Boolean, default=False)
 
 class EstacionClimatologica(Base):
     """Catálogo relacional de estaciones descargadas/imputadas."""
@@ -35,3 +37,15 @@ class SessionState(Base):
     key = Column(String, primary_key=True)
     data_type = Column(String, nullable=False) # 'json', 'parquet', 'bytes', 'folder_backup'
     blob_data = Column(LargeBinary, nullable=False)
+
+class AuditLog(Base):
+    """Registro de trazabilidad y auditoría de eventos del proyecto."""
+    __tablename__ = 'hidro_audit_log'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    modulo = Column(String, nullable=False)
+    accion = Column(String, nullable=False)
+    detalle = Column(String, nullable=True)
+    usuario = Column(String, default="HidroSistem User")
+

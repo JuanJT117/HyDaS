@@ -19,9 +19,9 @@ add_binaries = []
 
 if sys.platform == "win32":
     print("🖥️  Plataforma detectada: WINDOWS")
-    # En Windows, empaquetamos las .dll del entorno local
-    # (El usuario debe tener instaladas las dependencias en su entorno)
-    add_binaries.append("--add-binary=C:/Users/USER/anaconda3/envs/flet_env/Lib/site-packages/rasterio/*.dll;rasterio")
+    # En Windows, empaquetamos dinámicamente las .dll del entorno activo
+    rasterio_dll_path = os.path.join(sys.prefix, "Lib", "site-packages", "rasterio", "*.dll")
+    add_binaries.append(f"--add-binary={rasterio_dll_path};rasterio")
 elif sys.platform.startswith("linux"):
     print("🐧 Plataforma detectada: LINUX")
     print("⚠️  ADVERTENCIA GLIBC: Para máxima compatibilidad hacia atrás (forward compatibility),")

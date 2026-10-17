@@ -81,7 +81,7 @@ def obtener_clave_estado(nombre_shp):
 
 class GestorExtraccion:
     @staticmethod
-    def filtrar_estaciones_por_buffer(buffer_geom, df_estaciones: pd.DataFrame) -> list:
+    def filtrar_estaciones_por_buffer(buffer_geom, df_estaciones: pd.DataFrame, wkt_envolvente: str = None, buffer_km: float = 100.0) -> list:
         try:
             if df_estaciones is None or df_estaciones.empty: return []
             
@@ -98,6 +98,18 @@ class GestorExtraccion:
             
             if df_limpio.empty: return []
 
+            # --- INNOVACIÓN ZERO-TRUST & MULTICUENCA: Núcleo Envolvente ---
+            from shapely import wkt
+            wkt_env = wkt_envolvente or (buffer_geom if isinstance(buffer_geom, str) else None)
+            if wkt_env is not None:
+                geom_env = wkt.loads(wkt_env) if isinstance(wkt_env, str) else wkt_env
+                buffer_gs = gpd.GeoSeries([geom_env.buffer(buffer_km * 1000)], crs="EPSG:32614").to_crs("EPSG:4326")
+                buffer_geom_final = buffer_gs.iloc[0]
+            else:
+                buffer_geom_final = buffer_geom
+                
+            if buffer_geom_final is None: return []
+
             # Adaptación Métrica o Geográfica
             max_lon_abs = df_limpio['lon'].abs().max()
             if max_lon_abs > 180:
@@ -108,7 +120,7 @@ class GestorExtraccion:
                 estaciones_gdf = gpd.GeoDataFrame(df_limpio, geometry=gpd.points_from_xy(df_limpio['lon_real'], df_limpio['lat_real']), crs='EPSG:4326')
 
             # INTERSECCIÓN INQUEBRANTABLE
-            buffer_gs = gpd.GeoSeries([buffer_geom], crs="EPSG:4326")
+            buffer_gs = gpd.GeoSeries([buffer_geom_final], crs="EPSG:4326")
             mask = estaciones_gdf.geometry.intersects(buffer_gs.iloc[0])
             estaciones_objetivo = estaciones_gdf[mask]
             

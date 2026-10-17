@@ -48,8 +48,23 @@ TRANSPARENT_PIXEL = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mN
 
 def build_topologia_view(page: ft.Page):
     
-    # --- ESTADO LOCAL ---
+    # --- ESTADO LOCAL & REHIDRATACIÓN DESDE EL PROYECTO (FASE 2) ---
     capas_memoria = {"cuenca": None, "cauces": None, "suelo": None, "thiessen": None}
+    
+    # Rehidratar capas espaciales existentes desde el GeoPackage activo
+    if pm.db_path and os.path.exists(pm.db_path):
+        try:
+            capas_existentes = pm.listar_capas_espaciales()
+            if "shp_cuenca_limite" in capas_existentes:
+                capas_memoria["cuenca"] = pm.cargar_capa_espacial("shp_cuenca_limite")
+            if "shp_cauces" in capas_existentes:
+                capas_memoria["cauces"] = pm.cargar_capa_espacial("shp_cauces")
+            if "shp_uso_suelo" in capas_existentes:
+                capas_memoria["suelo"] = pm.cargar_capa_espacial("shp_uso_suelo")
+            if "shp_thiessen" in capas_existentes:
+                capas_memoria["thiessen"] = pm.cargar_capa_espacial("shp_thiessen")
+        except Exception as e:
+            print(f"[WARN] No se pudieron rehidratar capas espaciales previas: {e}")
     
     # --- UI COMPONENTES ---
     img_visor = ft.Image(src_base64=TRANSPARENT_PIXEL, expand=True, fit=ft.ImageFit.CONTAIN)
@@ -80,6 +95,10 @@ def build_topologia_view(page: ft.Page):
             loading_ring.visible = False; page.update()
         threading.Thread(target=_task, daemon=True).start()
 
+    # Si hay capas rehidratadas, renderizar de inmediato
+    if any(capas_memoria.values()):
+        renderizar_mapa()
+
     # --- LÓGICA: GENERAR PLANTILLAS INTERNAS (GeoPackage) ---
     def generar_plantillas_base(e):
         def _task():
@@ -106,8 +125,11 @@ def build_topologia_view(page: ft.Page):
     # [PARCHE DEVSECOPS: EXPORTACIÓN EXTERNA]
     # Aislamiento de capas base para su edición segura en QGIS.
     # =========================================================================
-    dir_picker_export = ft.FilePicker()
-    page.overlay.append(dir_picker_export)
+    dir_picker_export = page.session.get("topologia_dir_picker_export")
+    if not dir_picker_export:
+        dir_picker_export = ft.FilePicker()
+        page.session.set("topologia_dir_picker_export", dir_picker_export)
+        page.overlay.append(dir_picker_export)
 
     def on_export_dir_picked(e: ft.FilePickerResultEvent):
         if not e.path: return 
@@ -188,13 +210,19 @@ def build_topologia_view(page: ft.Page):
                 loading_ring.visible = False; page.update()
         page.run_thread(_task)
 
-    file_picker_dem = ft.FilePicker()
-    page.overlay.append(file_picker_dem)
+    file_picker_dem = page.session.get("topologia_file_picker_dem")
+    if not file_picker_dem:
+        file_picker_dem = ft.FilePicker()
+        page.session.set("topologia_file_picker_dem", file_picker_dem)
+        page.overlay.append(file_picker_dem)
     file_picker_dem.on_result = lambda e: procesar_dem_ui(e.files[0].path) if e.files else None
 
     # --- LÓGICA: INGESTA DE SHP EDITADOS (Aduana) ---
-    file_picker = ft.FilePicker()
-    page.overlay.append(file_picker)
+    file_picker = page.session.get("topologia_file_picker")
+    if not file_picker:
+        file_picker = ft.FilePicker()
+        page.session.set("topologia_file_picker", file_picker)
+        page.overlay.append(file_picker)
     tipo_capa_actual = None
 
     def on_file_picked(e: ft.FilePickerResultEvent):

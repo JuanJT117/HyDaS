@@ -27,7 +27,7 @@ def build_gastos_view(page: ft.Page):
         "datos_cuencas_config", "df_cuencas_base", "df_cotas", "df_hms", 
         "df_intensidad", "df_altura", "res_racional", "res_chow", "df_variables", 
         "estaciones_db", "pesos_estaciones", "station_counter", "target_station_id",
-        "res_hms_peak", "res_hidrogramas", "modo_lluvia_activo"
+        "res_hms_peak", "res_hidrogramas", "modo_lluvia_activo", "aplicar_temez"
     ]
     
     # Inicialización de la Base de Datos de Escenarios
@@ -100,6 +100,8 @@ def build_gastos_view(page: ft.Page):
                 page.session.set(k, val)
             
             # Rehidratar toda la interfaz
+            if 'sw_aplicar_temez' in locals():
+                sw_aplicar_temez.value = bool(page.session.get("aplicar_temez") or False)
             rg_modo_calculo.value = page.session.get("modo_lluvia_activo") or "simple"
             cambiar_modo_lluvia(None)
             render_manual_tables()
@@ -138,7 +140,22 @@ def build_gastos_view(page: ft.Page):
     btn_detener = ft.ElevatedButton("DETENER CÁLCULO", icon=ft.Icons.STOP, visible=False, style=ft.ButtonStyle(color="white", bgcolor="#cc0000"), on_click=lambda _: gastos.señal_abortar_gastos.set())
     tabs_res = ft.Tabs(selected_index=0, visible=False)
     
-    rg_modo_calculo = ft.RadioGroup(content=ft.Row([ft.Radio(value="simple", label="Modo Simple (Global)", fill_color="#00ff41"), ft.Radio(value="dist", label="Modo Distribuido (Thiessen)", fill_color="#00ff41")]), value="simple")
+    # =========================================================================
+    # RESTRUCTURACIÓN DEL ENTORNO PLUVIAL Y CONTROL DE ESCALA - FLET 0.28+
+    # =========================================================================
+    rg_modo_calculo = ft.RadioGroup(
+        content=ft.Column([
+            ft.Radio(value="simple", label="Modo Simple (Global Pluvial puntual)", fill_color="#00ff41"),
+            ft.Radio(value="dist", label="Modo Distribuido (Polígonos de Thiessen)", fill_color="#00ff41"),
+            # Nuevas opciones de la Directiva de Diseño v2.0
+            ft.Radio(value="regional_arf", label="Cuenca Regional Active (Modelo ARF)", fill_color="#00ff41", disabled=True),
+            ft.Radio(value="multicuenca_arf", label="Multicuenca Regional (ARF - Placeholder)", fill_color="#00ff41", disabled=True)
+        ]),
+        value="simple"
+    )
+    
+    # Contenedor dinámico que renderizará la tabla proveniente de ARF
+    contenedor_tablas_regional = ft.Container(visible=False, padding=10)
     rg_metodo_tc = ft.RadioGroup(content=ft.Row([ft.Radio(value="Kirpich", label="Kirpich (Urbano/Canal)", fill_color="#00ff41"), ft.Radio(value="Temez", label="Témez (Rural/SCT)", fill_color="#00ff41")]), value="Kirpich")
 
     # NUEVO: Mensaje de error específico para la Matriz de Thiessen
@@ -189,6 +206,15 @@ def build_gastos_view(page: ft.Page):
         ]
     )
 
+    banner_advertencia = ft.Container(
+        content=ft.Row([
+            ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, color="#ffffff"),
+            ft.Text("", color="#ffffff", size=12, weight="bold")
+        ], alignment=ft.MainAxisAlignment.START),
+        bgcolor="#ff9900", padding=ft.padding.all(12), border_radius=ft.border_radius.all(6),
+        margin=ft.margin.only(bottom=10), visible=False
+    )
+
     # 3. Ensamblaje del nuevo Panel y Banner de Advertencia ARF
     banner_alerta_arf = ft.Container(
         content=ft.Row([
@@ -199,12 +225,26 @@ def build_gastos_view(page: ft.Page):
         visible=False # Se controla por la sesión en la rehidratación
     )
 
+    sw_aplicar_temez = ft.Switch(
+        label="Aplicar Reducción Areal de Témez en Racional (KA)",
+        value=bool(page.session.get("aplicar_temez") or False), # Por defecto desactivado para ver gasto pleno
+        active_color="#00ff41",
+        tooltip="Atenúa la intensidad en cuencas > 1 km² mediante Témez. Mantener apagado para microcuencas o si se usa el Módulo 4 (ARF)."
+    )
+
+    def on_cambio_temez(e):
+        page.session.set("aplicar_temez", sw_aplicar_temez.value)
+        page.update()
+    sw_aplicar_temez.on_change = on_cambio_temez
+
     panel_parametros_avanzados = ft.Container(
         content=ft.Column([
+            banner_advertencia,
             banner_alerta_arf, # <--- BANNER INYECTADO
             ft.Text("Configuración del Modelo Hidrológico (Frontera y Cinemática)", weight="bold", color="#00ff41"),
             ft.Row([inp_tr_lista, dd_tormenta, dd_cinematica], wrap=True, spacing=15),
-            ft.Row([inp_fcc, dd_amc, inp_qbase], wrap=True, spacing=15)
+            ft.Row([inp_fcc, dd_amc, inp_qbase], wrap=True, spacing=15),
+            ft.Row([sw_aplicar_temez], alignment=ft.MainAxisAlignment.START)
         ], spacing=10),
         padding=15, border=ft.border.all(1, "#333333"), border_radius=10, margin=ft.margin.only(top=10, bottom=10)
     )
@@ -517,29 +557,39 @@ def build_gastos_view(page: ft.Page):
                 page.snack_bar = ft.SnackBar(ft.Text(f"Error carga: {ex}"), bgcolor="red", open=True)
             page.update()
 
-    # Pickers
-    pk_area = ft.FilePicker(on_result=lambda e: load(e, "df_cuencas_base", None, 0))
-    pk_cot  = ft.FilePicker(on_result=lambda e: load(e, "df_cotas", None, None))
-    pk_int = ft.FilePicker(on_result=lambda e: load(e, "df_intensidad", st_int, 0))
-    pk_alt = ft.FilePicker(on_result=lambda e: load(e, "df_altura", st_alt, 0))
-    page.overlay.extend([pk_area, pk_cot, pk_int, pk_alt])
+    # Pickers cacheados en page.session
+    def _get_or_create_picker(key, on_result):
+        p = page.session.get(key)
+        if not p:
+            p = ft.FilePicker(on_result=on_result)
+            page.session.set(key, p)
+            page.overlay.append(p)
+        else:
+            p.on_result = on_result
+        return p
+
+    pk_area = _get_or_create_picker("gastos_pk_area", lambda e: load(e, "df_cuencas_base", None, 0))
+    pk_cot  = _get_or_create_picker("gastos_pk_cot", lambda e: load(e, "df_cotas", None, None))
+    pk_int = _get_or_create_picker("gastos_pk_int", lambda e: load(e, "df_intensidad", st_int, 0))
+    pk_alt = _get_or_create_picker("gastos_pk_alt", lambda e: load(e, "df_altura", st_alt, 0))
 
     # ==========================================
     # 6. GESTOR DE ESTACIONES (THIESSEN AUTOMÁTICO)
     # ==========================================
     lista_estaciones_ui = ft.Column(spacing=5)
     
-    def auto_cargar_thiessen():
+    def auto_cargar_thiessen(silencioso=False):
         """El puente mágico con el Módulo 3. Inyecta curvas IDF guardadas como estaciones."""
         db_curvas = page.session.get("db_curvas_procesadas")
         
         # --- CHEQUEO DE INTEGRIDAD (Cero fallas silenciosas) ---
         if not db_curvas:
-            page.snack_bar = ft.SnackBar(
-                ft.Text("⚠️ Faltan Datos: El Módulo 3 no ha generado curvas. Completa el análisis primero.", color="white", weight="bold"), 
-                bgcolor="#cc0000", open=True
-            )
-            page.update()
+            if not silencioso:
+                page.snack_bar = ft.SnackBar(
+                    ft.Text("⚠️ Faltan Datos: El Módulo 3 no ha generado curvas. Completa el análisis primero.", color="white", weight="bold"), 
+                    bgcolor="#cc0000", open=True
+                )
+                page.update()
             return # Abortamos la carga porque no hay nada que cargar
             
         db_estaciones = page.session.get("estaciones_db") or {}
@@ -1075,7 +1125,11 @@ def build_gastos_view(page: ft.Page):
                     df_int_global=page.session.get("df_intensidad"), df_alt_global=page.session.get("df_altura"),
                     fcc=v_fcc, condicion_amc=v_amc, flujo_base=v_qbase, lista_tr=tr_cols_calc,
                     tipo_tormenta=v_tormenta, tipo_cinematica=v_cinematica,
-                    aplicar_arf=aplicar_reduccion_areal # <--- PARÁMETRO DE PUENTE INYECTADO
+                    aplicar_temez=sw_aplicar_temez.value, # <--- ENLACE DIRECTO
+                    aplicar_arf=aplicar_reduccion_areal, # <--- PARÁMETRO DE PUENTE INYECTADO
+                    df_intensidad_arf=page.session.get("arf_df_intensidad_maestra"),
+                    df_altura_arf=page.session.get("arf_df_altura_maestra"),
+                    page=page
                 )
                 
                 if res_r is not None:
@@ -1088,6 +1142,9 @@ def build_gastos_view(page: ft.Page):
                     log_txt.value = "✅ Cálculo finalizado exitosamente."
                     log_txt.color = "green"
                     
+                    if rg_modo_calculo.value == "regional_arf":
+                        cargar_tablas_desde_arf()
+                        
                     # --- GUARDADO AUTOMÁTICO EN EL ESCENARIO ACTUAL ---
                     guardar_escenario_actual()
                     
@@ -1239,10 +1296,81 @@ def build_gastos_view(page: ft.Page):
         ft.Container(content=ft.Column([ft.Row([tabla_pesos], scroll=ft.ScrollMode.AUTO)], scroll=ft.ScrollMode.ADAPTIVE), height=300, border=ft.border.all(1, "#333333"))
     ], visible=False)
 
+    def cargar_tablas_desde_arf():
+        """
+        [Directriz 1 - Persistencia & Zero-Trust] Hidrata la interfaz visual de Gastos 
+        con la matriz de intensidades del ESCENARIO ACTIVO, sin mutar ni sobreescribir 
+        variables de sesión para evitar el State Clobbering.
+        """
+        df_i_esc = page.session.get("df_intensidad")
+        
+        if df_i_esc is not None and isinstance(df_i_esc, (pd.DataFrame, pd.Series)) and not (hasattr(df_i_esc, "empty") and df_i_esc.empty):
+            columnas = [ft.DataColumn(ft.Text("Duración (min)", color="#00ff41"))] + \
+                       [ft.DataColumn(ft.Text(f"Tr {col} años", color="#00ff41")) for col in df_i_esc.columns]
+            
+            filas_render = []
+            for duracion, row in df_i_esc.iterrows():
+                celdas = [ft.DataCell(ft.Text(str(duracion), weight="bold"))] + \
+                         [ft.DataCell(ft.Text(f"{val:.2f}")) for val in row.values]
+                filas_render.append(ft.DataRow(cells=celdas))
+                
+            tabla_flet = ft.DataTable(
+                columns=columnas,
+                rows=filas_render,
+                heading_row_color="#1a1a1a",
+                divider_thickness=1
+            )
+            
+            contenedor_tablas_regional.content = ft.Column([
+                ft.Text("MATRIZ DE INTENSIDADES (ESCENARIO ACTIVO - mm/h)", weight="bold", size=13, color="#00ff41"),
+                ft.Container(content=ft.Row([tabla_flet], scroll=ft.ScrollMode.AUTO), border=ft.border.all(1, "#333333"), border_radius=4)
+            ], scroll=ft.ScrollMode.ADAPTIVE)
+            contenedor_tablas_regional.visible = True
+        else:
+            contenedor_tablas_regional.content = ft.Column([
+                ft.Text("MATRIZ DE INTENSIDADES (ESCENARIO ACTIVO)", weight="bold", size=13, color="#00ff41"),
+                ft.Text("No hay datos de lluvia importados para este escenario. Presione 'CALCULAR' para ejecutar el Bypass Regional e importar los datos del Módulo 4.", color="grey", size=12)
+            ], scroll=ft.ScrollMode.ADAPTIVE)
+            contenedor_tablas_regional.visible = True
+        page.update()
+
+    def evaluar_escala_cuenca_y_actualizar_ui():
+        """
+        [Directriz 6 - Zero-Trust] Evalúa el área de la cuenca y altera dinámicamente
+        los contratos de la interfaz Flet para evitar errores metodológicos del usuario.
+        """
+        area_cuenca = page.session.get("area_cuenca_km2") or 0.0
+        
+        if area_cuenca > 25.0:
+            rg_modo_calculo.content.controls[2].disabled = False  # Cuenca Regional (ARF)
+            rg_modo_calculo.content.controls[3].disabled = False  # Multicuenca (ARF)
+            rg_modo_calculo.value = "regional_arf"
+            
+            banner_advertencia.content.controls[1].value = (
+                f"Área de cuenca crítica detectada ({area_cuenca:.2f} km² > 25 km²). "
+                "Modo Regional ARF activado automáticamente. Los métodos empíricos (Racional/Chow) "
+                "se computarán únicamente con fines normativos/referenciales."
+            )
+            banner_advertencia.visible = True
+            # ELIMINADO: cargar_tablas_desde_arf() - Evitar State Clobbering al inicializar.
+            if page.session.get("df_intensidad") is not None:
+                cargar_tablas_desde_arf()
+        else:
+            rg_modo_calculo.content.controls[2].disabled = True
+            rg_modo_calculo.content.controls[3].disabled = True
+            banner_advertencia.visible = False
+
     def cambiar_modo_lluvia(e):
         is_dist = (rg_modo_calculo.value == "dist")
-        modulo_simple.visible = not is_dist
+        is_reg = (rg_modo_calculo.value == "regional_arf")
+        modulo_simple.visible = not is_dist and not is_reg
         modulo_distribuido.visible = is_dist
+        if is_reg:
+            contenedor_tablas_regional.visible = True
+            # No sobreescribir datos desde ARF por la fuerza en el on_change
+            cargar_tablas_desde_arf()
+        else:
+            contenedor_tablas_regional.visible = False
         page.session.set("modo_lluvia_activo", rg_modo_calculo.value)
         page.update()
 
@@ -1321,7 +1449,7 @@ def build_gastos_view(page: ft.Page):
             ft.Container(content=ft.Column([ft.Text("Distribución Lluvia:", weight="bold"), rg_modo_calculo]), padding=10, border=ft.border.all(1, "#333333"), border_radius=10, expand=True),
         ]),
         panel_parametros_avanzados,
-        ft.Divider(), modulo_simple, modulo_distribuido
+        ft.Divider(), modulo_simple, modulo_distribuido, contenedor_tablas_regional
     ], scroll=ft.ScrollMode.AUTO), padding=20))
     
     # ==========================================
@@ -1449,8 +1577,8 @@ def build_gastos_view(page: ft.Page):
             # 1. Cargamos Dropdown de escenarios
             actualizar_dropdown_escenarios()
             
-            # 2. Inyección Mágica: Traemos datos procesados del Módulo 3
-            auto_cargar_thiessen()
+            # 2. Inyección Mágica: Traemos datos procesados del Módulo 3 (silencioso al arranque)
+            auto_cargar_thiessen(silencioso=True)
             
             # --- EVALUACIÓN FASE 7.1 (ESTADO ARF) ---
             requiere_arf = page.session.get("arf_requerido")
@@ -1464,7 +1592,9 @@ def build_gastos_view(page: ft.Page):
             # 3. Restaurar UI
             render_manual_tables()
             validar_nombres_cuencas()
-            rg_modo_calculo.value = page.session.get("modo_lluvia_activo") or "simple"
+            evaluar_escala_cuenca_y_actualizar_ui()
+            if rg_modo_calculo.value != "regional_arf":
+                rg_modo_calculo.value = page.session.get("modo_lluvia_activo") or "simple"
             cambiar_modo_lluvia(None)
             upd_tbl()
             render_estaciones()

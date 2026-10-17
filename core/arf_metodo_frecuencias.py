@@ -139,28 +139,32 @@ class MotorFrecuencias:
                 distribuciones_ganadoras[est] = dist_est_name
                 laminas_estaciones[est] = MotorFrecuencias._extraer_lamina_24h(dist_est_name, df_ams_estaciones[est], tr_lista)
 
-            # --- PASO 3: KRIGING PROBABILÍSTICO POR Tr ---
+            # --- PASO 3: KRIGING PROBABILÍSTICO POR Tr (ESPACIO MÉTRICO) ---
             laminas_kriging = {}
-            x_coords = []
-            y_coords = []
-            claves_validas = []
             
-            for est in estaciones:
-                if est in df_coords.index:
-                    x_coords.append(df_coords.loc[est, 'LONGITUD'])
-                    y_coords.append(df_coords.loc[est, 'LATITUD'])
-                    claves_validas.append(est)
-                    
-            x = np.array(x_coords)
-            y = np.array(y_coords)
+            # Extraer solo las coordenadas válidas
+            df_cv = df_coords.loc[[est for est in estaciones if est in df_coords.index]]
+            claves_validas = df_cv.index.tolist()
             
-            # Preparar Máscara de Cuenca
-            minx, miny, maxx, maxy = gdf_cuenca.total_bounds
+            # 🚀 PROYECCIÓN MÉTRICA (EPSG:6933)
+            gdf_pts = gpd.GeoDataFrame(
+                df_cv, geometry=gpd.points_from_xy(df_cv['LONGITUD'], df_cv['LATITUD']), crs="EPSG:4326"
+            ).to_crs("EPSG:6933")
+            
+            x = gdf_pts.geometry.x.values
+            y = gdf_pts.geometry.y.values
+            
+            # Proyectar Cuenca y preparar Máscara Geométrica
+            gdf_cuenca_metric = gdf_cuenca.to_crs("EPSG:6933")
+            minx, miny, maxx, maxy = gdf_cuenca_metric.total_bounds
+            
+            # El Bounding Box ahora está en Metros
             xi = np.linspace(minx, maxx, 100)
             yi = np.linspace(miny, maxy, 100)
             XI, YI = np.meshgrid(xi, yi)
             mask = np.zeros_like(XI, dtype=bool)
-            poly = gdf_cuenca.geometry[0]
+            poly = gdf_cuenca_metric.geometry[0]
+            
             for i in range(XI.shape[0]):
                 for j in range(XI.shape[1]):
                     if poly.contains(Point(XI[i,j], YI[i,j])): mask[i,j] = True
@@ -193,7 +197,7 @@ class MotorFrecuencias:
                 cbar.ax.yaxis.set_tick_params(color='white')
                 plt.setp(plt.getp(cbar.ax.axes, 'yticklabels'), color='white')
                 
-                gdf_cuenca.plot(ax=ax_k, facecolor='none', edgecolor='#00ff41', linewidth=2)
+                gdf_cuenca_metric.plot(ax=ax_k, facecolor='none', edgecolor='#00ff41', linewidth=2)
                 ax_k.scatter(x, y, c='white', edgecolor='black', s=20)
                 
                 # ZOOM ESTRICTO A LA CUENCA CON UN MARGEN DEL 15% (El Secreto)

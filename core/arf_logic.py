@@ -275,19 +275,29 @@ class GestorMatricesARF:
             if len(lluvia_coords) < 3:
                 ax.text(0.5, 0.5, "Estaciones insuficientes para interpolar", color='grey', ha='center')
             else:
-                x = lluvia_coords['LON'].values
-                y = lluvia_coords['LAT'].values
+                # --- 🚀 PROYECCIÓN MÉTRICA ABSOLUTA (EPSG:6933) ---
+                gdf_pts = gpd.GeoDataFrame(
+                    lluvia_coords, 
+                    geometry=gpd.points_from_xy(lluvia_coords['LON'], lluvia_coords['LAT']),
+                    crs="EPSG:4326"
+                ).to_crs("EPSG:6933")
+                
+                x = gdf_pts.geometry.x.values
+                y = gdf_pts.geometry.y.values
                 z = lluvia_coords['PRECIP'].values
-                claves = lluvia_coords.index.values # Extraer claves de estación
+                claves = lluvia_coords.index.values 
                 
-                min_lon, max_lon = x.min(), x.max()
-                min_lat, max_lat = y.min(), y.max()
+                # Proyectar la cuenca al mismo sistema métrico
+                gdf_cuenca_metric = gdf_cuenca.to_crs("EPSG:6933")
                 
-                margen_lon = (max_lon - min_lon) * 0.10
-                margen_lat = (max_lat - min_lat) * 0.10
+                min_x, max_x = x.min(), x.max()
+                min_y, max_y = y.min(), y.max()
                 
-                xi = np.linspace(min_lon - margen_lon, max_lon + margen_lon, 100)
-                yi = np.linspace(min_lat - margen_lat, max_lat + margen_lat, 100)
+                margen_x = (max_x - min_x) * 0.10
+                margen_y = (max_y - min_y) * 0.10
+                
+                xi = np.linspace(min_x - margen_x, max_x + margen_x, 100)
+                yi = np.linspace(min_y - margen_y, max_y + margen_y, 100)
                 XI, YI = np.meshgrid(xi, yi)
                 
                 rbf = Rbf(x, y, z, function='linear')
@@ -303,7 +313,7 @@ class GestorMatricesARF:
                 cbar.ax.yaxis.set_tick_params(color='white')
                 plt.setp(plt.getp(cbar.ax.axes, 'yticklabels'), color='white')
 
-                gdf_cuenca.plot(ax=ax, facecolor='none', edgecolor='#00ff41', linewidth=2)
+                gdf_cuenca_metric.plot(ax=ax, facecolor='none', edgecolor='#00ff41', linewidth=2)
                 ax.scatter(x, y, c='white', edgecolor='black', s=30, zorder=5)
                 
                 # Rastrear el Epicentro Real
@@ -394,16 +404,32 @@ class GestorMatricesARF:
             rango_completo = pd.date_range(start=fecha_min, end=fecha_max, freq='D')
             df_maestro = df_pivot.reindex(rango_completo)
 
-            # 3. Filtro HPC (Lloviznas)
-            for col in df_maestro.columns:
+            # --- 🛡️ FILTRO ESTRICTO DE DATA SCIENCE: RESOLUCIÓN ESPACIAL MÍNIMA ---
+            print("🛡️ [TLÁLOC] Aplicando Filtro Espacial (Min. 30 estaciones activas por día)...")
+            # Contamos cuántas estaciones tienen datos válidos (no nulos) en cada día
+            estaciones_activas_por_dia = df_maestro[claves_validas].notnull().sum(axis=1)
+            
+            # Máscara booleana: True donde hay menos de 30 estaciones aportando datos
+            mascara_dias_invalidos = estaciones_activas_por_dia < 30
+            dias_purgados = mascara_dias_invalidos.sum()
+            
+            # Ejecutamos la anulación implacable: convertimos en NaN todos los registros de esos días
+            df_maestro.loc[mascara_dias_invalidos, claves_validas] = np.nan
+            print(f"🛑 [TLÁLOC] Cortafuegos activado: Se purgaron {dias_purgados} días por falta de densidad pluviométrica (< 30 estaciones).")
+
+            # 4. Filtro HPC (Lloviznas)
+            for col in claves_validas:
+                # Solo aplicar a los datos que sobrevivieron al cortafuegos
                 df_maestro.loc[df_maestro[col] <= umbral_lluvia, col] = 0.0
 
-            # 4. Cálculo de LMA
-            # TODO: Evolucionar a pesos espaciales estáticos en la próxima refactorización profunda.
-            # Por ahora, usamos media espacial directa ignorando NaNs para estabilidad inmediata.
+            # 5. Cálculo de LMA (Lluvia Media Areal)
+            # Calculamos la media espacial. Los días purgados darán NaN automáticamente.
             df_maestro['LMA_Base'] = df_maestro[claves_validas].mean(axis=1, skipna=True)
             
-            # 5. Cosecha AMS (Máximos Anuales de la LMA con Simultaneidad)
+            # Seguro adicional: forzar explícitamente la nulidad de la LMA en días inválidos
+            df_maestro.loc[mascara_dias_invalidos, 'LMA_Base'] = np.nan
+            
+            # 6. Cosecha AMS (Máximos Anuales de la LMA con Simultaneidad)
             df_ams = df_maestro[['LMA_Base']].groupby(df_maestro.index.year).max()
             df_ams.rename(columns={'LMA_Base': 'LMA_Max_Anual'}, inplace=True)
             
@@ -505,17 +531,29 @@ class GestorMatricesARF:
                             "valor": float(val_dom)
                         }
 
+            # --- SQLITE PERSISTENCE (RAM OPTIMIZATION) ---
+            print("💾 [TLÁLOC] Transfiriendo matriz maestra a SQLite para liberar RAM...")
+            b64_plot_serie = plot_serie(df_maestro)
+            try:
+                conn_sqlite = sqlite3.connect(ruta_hds)
+                df_maestro.to_sql("arf_matriz_maestra", conn_sqlite, if_exists="replace", index=True, index_label="Fecha")
+                conn_sqlite.close()
+                del df_maestro
+                gc.collect()
+            except Exception as e:
+                print(f"❌ Error al guardar en SQLite: {e}")
+
             # Preparar tabla AMS exportable
             tabla_ams = [{"anio": y, "lma": round(v, 2)} for y, v in df_ams['LMA_Max_Anual'].items()]
 
             paquete_datos = {
-                "matriz_maestra": df_maestro, "df_ams": df_ams,
+                "df_ams": df_ams,
                 "claves_activas": claves_validas,
                 "fecha_inicio": fecha_min.strftime('%Y-%m-%d'), "fecha_fin": fecha_max.strftime('%Y-%m-%d'),
                 "pct_secos": pct_secos, "lma_maxima": float(lma_max) if pd.notnull(lma_max) else 0.0,
                 "eval_omm": eval_omm, "color_omm": color_omm, "densidad": round(val_densidad, 1),
                 "tabla_ams": tabla_ams,
-                "plot_serie": plot_serie(df_maestro),
+                "plot_serie": b64_plot_serie,
                 "plot_ams": plot_ams_barras(df_ams),
                 "mapas_isoyetas": diccionario_mapas_ams
             }

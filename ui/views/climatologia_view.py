@@ -38,7 +38,15 @@ def build_climatologia_view(page: ft.Page):
         
         # Recuperamos directamente del almacén persistente para evitar recalculaciones
         if est_id in db_clima:
-            df_normales = db_clima[est_id]["clima_df_normales"]
+            raw_norm = db_clima[est_id]["clima_df_normales"]
+            if isinstance(raw_norm, pd.DataFrame):
+                df_normales = raw_norm
+            elif isinstance(raw_norm, dict) and "path" in raw_norm and os.path.exists(raw_norm["path"]):
+                df_normales = pd.read_parquet(raw_norm["path"])
+            elif isinstance(raw_norm, str) and os.path.exists(raw_norm):
+                df_normales = pd.read_parquet(raw_norm)
+            else:
+                df_normales = climatologia_logic.calcular_normales_climatologicas(estado.get("df_activo"))
             extremos = db_clima[est_id]["clima_extremos"]
         else:
             df_normales = climatologia_logic.calcular_normales_climatologicas(estado["df_activo"])
@@ -49,7 +57,13 @@ def build_climatologia_view(page: ft.Page):
         page.snack_bar = ft.SnackBar(ft.Text(msj, color="black", weight="bold"), bgcolor=color_sb, open=True)
         page.update()
 
-    picker_reporte = ft.FilePicker(on_result=guardar_reporte_latex)
+    picker_reporte = page.session.get("clima_picker_reporte")
+    if not picker_reporte:
+        picker_reporte = ft.FilePicker(on_result=guardar_reporte_latex)
+        page.session.set("clima_picker_reporte", picker_reporte)
+        page.overlay.append(picker_reporte)
+    else:
+        picker_reporte.on_result = guardar_reporte_latex
     
     btn_reporte = ft.ElevatedButton(
         "Generar Reporte Climático",
@@ -70,12 +84,13 @@ def build_climatologia_view(page: ft.Page):
             txt_status.value = f"🚀 Estación {est_id}: Recuperada instantáneamente de la memoria del proyecto."
             txt_status.color = "#00ff41"
             
-            # Hidratamos el estado de memoria DESDE EL DISCO (Lazy Loading)
             data_saved = db_clima[est_id]
             
             try:
-                estado["df_activo"] = pd.read_parquet(data_saved["clima_df_activo"]["path"])
-                df_normales_ui = pd.read_parquet(data_saved["clima_df_normales"]["path"])
+                raw_act = data_saved["clima_df_activo"]
+                estado["df_activo"] = raw_act if isinstance(raw_act, pd.DataFrame) else pd.read_parquet(raw_act["path"])
+                raw_norm = data_saved["clima_df_normales"]
+                df_normales_ui = raw_norm if isinstance(raw_norm, pd.DataFrame) else pd.read_parquet(raw_norm["path"])
             except Exception as e:
                 txt_status.value, txt_status.color = f"❌ Error leyendo caché: {e}", "red"; page.update(); return
                 
@@ -123,8 +138,13 @@ def build_climatologia_view(page: ft.Page):
             txt_status.color = "red"
         page.update()
 
-    picker_carpeta = ft.FilePicker(on_result=procesar_directorio)
-    page.overlay.extend([picker_carpeta, picker_reporte])
+    picker_carpeta = page.session.get("clima_picker_carpeta")
+    if not picker_carpeta:
+        picker_carpeta = ft.FilePicker(on_result=procesar_directorio)
+        page.session.set("clima_picker_carpeta", picker_carpeta)
+        page.overlay.append(picker_carpeta)
+    else:
+        picker_carpeta.on_result = procesar_directorio
 
     # ==========================================
     # CEREBRO DE CÁLCULO Y VOLCADO A PERSISTENCIA
